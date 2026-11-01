@@ -13,4 +13,6 @@ The framing that follows: a general way to sell anything that loses value once s
 
 The privacy track prompt asks for NEAR AI Cloud, attestation with a fresh nonce, a Verified panel, nothing kept server side, and fictional sample data. Darkroom covers all but NEAR AI Cloud and the panel, which belongs to the UI stage.
 
+Update: Gloam is now built in, as the private payment path. See gloam-design.md.
+
 Gloam offers private balances and payments on Base, Ethereum, Tempo and Robinhood Chain, not NEAR, reachable through Intents, which is mainnet only. Its docs were not read. It could hide who paid whom, but it costs real funds, and it would dilute a NEAR-centred entry. Not planned for the core.

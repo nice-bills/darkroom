@@ -21,7 +21,7 @@ if [ "${ROOM_WASM_HOST:-}" = walrus ]; then
   sleep 10
 fi
 [ -n "$URL" ] || URL=$(outlayer upload "$WASM" 2>&1 | grep -oE 'https://[^ ]+\.wasm' | head -1)
-[ "$(curl -sS -m 60 "$URL" | sha256sum | cut -d' ' -f1)" = "$HASH" ] || { echo "URL does not serve this build: $URL"; exit 1; }
+for attempt in 1 2 3 4 5 6 7 8; do [ "$(curl -sSL -m 60 "$URL" | sha256sum | cut -d" " -f1)" = "$HASH" ] && break; [ "$attempt" = 8 ] && { echo "URL does not serve this build: $URL"; exit 1; }; sleep 15; done
 sleep 5
 retry outlayer deploy room "$URL" --hash "$HASH"
 sleep 5

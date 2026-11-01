@@ -53,6 +53,8 @@ Fix, built locally: payment first, then reveal.
 
 A sealed copy is needed, not a re-read of the secret row: the seller could delete the row after being paid.
 
+At this stage the room did not check the chain itself. It does now.
+
 The room does not check the chain itself. It relies on the manifest admitting only the contract, so that contract must stay locked:
 
 - The `only` rule admits the account that called OutLayer, including a direct call signed with the contract account's own key. Whoever holds that key can start a reveal for free. Delete the contract's full-access keys before any real use. Today it uses the throwaway key, which is acceptable only for spikes.

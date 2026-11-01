@@ -21,9 +21,9 @@ Core first, then UI and UX, then the demo.
 ## Open before UI
 
 - [ ] Attested model. Needed for the privacy claim. See below.
-- [ ] Permanent wasm URL. Temporary hosts expire, and FastFS is down. A GitHub release works once the repo is public.
+- [x] Durable wasm URL: Walrus testnet, 50 days. Old note: a GitHub release works once the repo is public.
 - [ ] Final freeze: delete the full-access keys on the contract and project owner, so the "no operator" claim is true on the deployment. Irreversible, so do this last.
-- [ ] Yield/resume against a real worker, if OutLayer's on-chain door comes back.
+- [x] Yield/resume against a real worker: `DOOR=chain scripts/e2e.sh`.
 
 ## Model options
 
