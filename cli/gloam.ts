@@ -5,11 +5,14 @@
 import * as G from "@gloamtrade/sdk";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import os, { homedir } from "node:os";
 import { join } from "node:path";
 import { createPublicClient, createWalletClient, http, parseAbi } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 
+const cpus = os.cpus();
+// snarkjs starts a prover per CPU the host reports, which a small container cannot hold in memory.
+os.cpus = () => cpus.slice(0, 1);
 const net = G.GLOAM_NETWORKS.tempo;
 const asset = G.TEMPO_PATHUSD;
 const FIELD = 21888242871839275222246405745257275088548364400416034343698204186575808495617n;
