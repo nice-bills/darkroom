@@ -1,6 +1,6 @@
-use darkroom_core::gloam::{vault_bool, vault_request, Vault};
-use darkroom_core::{agreed, llm_auth, llm_body, llm_text, rpc_request, rpc_value, run, Error, Host};
-use outlayer::{encryption_keys, signing_keys, storage};
+use darkroom_core::gloam::Vault;
+use darkroom_core::{agreed, from_hex, llm_auth, llm_body, llm_text, room_mac, room_open, room_seal, rpc_request, rpc_value, run, Error, Host};
+use outlayer::{signing_keys, storage};
 use std::env;
 use std::io::{self, Read, Write};
 use std::time::Instant;
@@ -23,16 +23,16 @@ const RPC_URL_2: &str = env!("DARKROOM_RPC_URL_2");
 const CONTRACT: &str = env!("DARKROOM_CONTRACT");
 const VAULT_RPC: &str = env!("DARKROOM_VAULT_RPC");
 const VAULT_RPC_2: &str = env!("DARKROOM_VAULT_RPC_2");
-const VAULT: Vault = Vault {
-    pool: env!("DARKROOM_VAULT_POOL"),
-    asset: env!("DARKROOM_VAULT_ASSET"),
-    chain_id: 42431,
-};
-const SEAL_KEY: &str = "sealed";
+const VAULT: Vault = Vault { asset: env!("DARKROOM_VAULT_ASSET") };
 const VERDICT_KEY: &str = "verdict";
 
 struct Enclave {
     started: Instant,
+}
+
+/// From the author row, which only this build can read, started by the contract or the relayer.
+fn room_key() -> Result<[u8; 32], Error> {
+    from_hex(&env::var("DARKROOM_ROOM_KEY")?)?.try_into().map_err(|_| "bad room key".into())
 }
 
 impl Host for Enclave {
@@ -48,23 +48,26 @@ impl Host for Enclave {
     }
 
     fn seal(&mut self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, Error> {
-        Ok(encryption_keys::encrypt(SEAL_KEY, None, plaintext, aad)?)
+        let mut nonce = [0u8; 12];
+        getrandom::getrandom(&mut nonce)?;
+        room_seal(&room_key()?, nonce, plaintext, aad)
     }
 
     fn open(&mut self, ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>, Error> {
-        Ok(encryption_keys::decrypt(SEAL_KEY, None, ciphertext, aad)?)
+        room_open(&room_key()?, ciphertext, aad)
     }
 
     fn mac(&mut self, data: &[u8]) -> Result<Vec<u8>, Error> {
-        Ok(encryption_keys::mac(SEAL_KEY, None, data)?)
+        Ok(room_mac(&room_key()?, data))
     }
 
     fn store(&mut self, key: &str, value: &[u8]) -> Result<(), Error> {
-        Ok(storage::set_raw(key, value)?)
+        // Worker storage belongs to the project, so either door can read it.
+        Ok(storage::set_worker(key, value)?)
     }
 
     fn load(&mut self, key: &str) -> Result<Option<Vec<u8>>, Error> {
-        Ok(storage::get_raw(key)?)
+        Ok(storage::get_worker(key)?)
     }
 
     fn publish(&mut self, key: &str, value: &[u8]) -> Result<(), Error> {
@@ -92,18 +95,18 @@ impl Host for Enclave {
         agreed(read(RPC_URL)?, read(RPC_URL_2)?)
     }
 
-    fn vault_read(&mut self, selector: [u8; 4], word: [u8; 32]) -> Result<bool, Error> {
-        let request = vault_request(VAULT.pool, selector, word).to_string();
-        let read = |url: &str| -> Result<bool, Error> {
+    fn receipts(&mut self, tx: &str) -> Result<[serde_json::Value; 2], Error> {
+        let request = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "eth_getTransactionReceipt", "params": [tx] }).to_string();
+        let read = |url: &str| -> Result<serde_json::Value, Error> {
             let (_, reply) = http::post(url, &[], request.as_bytes())?;
-            vault_bool(&serde_json::from_slice(&reply)?)
+            let reply: serde_json::Value = serde_json::from_slice(&reply)?;
+            Ok(reply["result"].clone())
         };
-        // A lagging source reads as a failed run, which the buyer retries. It never reveals early.
-        let (one, two) = (read(VAULT_RPC)?, read(VAULT_RPC_2)?);
-        if one != two {
-            return Err("vault RPCs disagree".into());
-        }
-        Ok(one)
+        Ok([read(VAULT_RPC)?, read(VAULT_RPC_2)?])
+    }
+
+    fn caller(&mut self) -> Option<String> {
+        outlayer::env::predecessor_account_id()
     }
 
     fn random32(&mut self) -> Result<[u8; 32], Error> {

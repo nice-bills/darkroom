@@ -19,14 +19,13 @@ const MAX_TITLE_LEN: usize = 200;
 const X25519_KEY_HEX_LEN: usize = 64;
 const USDC: u64 = 1_000_000;
 const COMMITMENT_HEX_LEN: usize = 64;
-/// A fixed size, so a sealed price cannot show its digits by its length, and the room has no
-/// wider channel here than a bucket: ephemeral key, 256 padded bytes, tag.
-const TERMS_HEX_LEN: usize = 2 * (32 + 256 + 16);
-const MAX_TICKET_LEN: usize = 2048;
-/// Ephemeral key, two u64s, tag.
-const MANDATE_HEX_LEN: usize = 2 * (32 + 16 + 16);
-/// About an hour for the buyer to pay and the seller to sweep.
-const PAY_WINDOW_BLOCKS: u64 = 3600;
+/// Ephemeral key, two u64s and the room's hash, tag.
+const MANDATE_HEX_LEN: usize = 2 * (32 + 48 + 16);
+/// About an hour for the buyer to pay. Nothing the seller does can use it up.
+const PAY_WINDOW_BLOCKS: u64 = 6000;
+const MAX_PROFILE_LEN: usize = 64;
+/// Pays for the listing's storage, so anyone filling the contract pays to do it.
+const LISTING_DEPOSIT: NearToken = NearToken::from_millinear(10);
 /// About six minutes. Well past any run, so only a silent relayer ever reaches this.
 const STALE_AFTER_BLOCKS: u64 = 600;
 /// Mirrors `PRICE_BUCKETS` in `enclave/core`: the enclave quantizes, the contract refuses
@@ -69,14 +68,12 @@ pub struct Room {
     pub protected_value: u64,
     pub status: Status,
     pub opened_at: u64,
-    /// Private deals: price and payee sealed to the buyer by the room.
-    pub terms: String,
+    /// `relay` or `chain`. Only that door may run the room, so it negotiates once.
+    pub door: String,
     /// Private rooms: the buyer's limit and value at risk, sealed to the room. `cap` holds the bond.
     pub mandate: String,
     /// Private deals: the bond has gone back to the buyer or over to the seller.
     pub bond_done: bool,
-    /// Private deals: the Gloam payment, sealed to the seller's key. The room checks it.
-    pub ticket: String,
 }
 
 #[derive(Deserialize)]
@@ -101,8 +98,6 @@ struct Verdict {
     ct_ref: String,
     #[serde(default)]
     ct_hash: String,
-    #[serde(default)]
-    terms: String,
     /// Relayed runs verify this in `settle_signed`. A yield/resume result is already authentic.
     #[serde(default)]
     #[allow(dead_code)]
@@ -113,10 +108,9 @@ struct Verdict {
 fn accepted_deal(value: Value, cap: u128, private: bool) -> Option<Verdict> {
     let verdict: Verdict = serde_json::from_value(value).ok()?;
     let priced = if private {
-        verdict.price == 0 && is_hex(&verdict.terms, TERMS_HEX_LEN)
+        verdict.price == 0
     } else {
-        verdict.terms.is_empty()
-            && verdict.price % USDC == 0
+        verdict.price % USDC == 0
             && PRICE_BUCKETS.contains(&(verdict.price / USDC))
             && verdict.price as u128 <= cap
     };
@@ -165,6 +159,7 @@ impl Darkroom {
     /// `profile` names the OutLayer secret row the seller stored for this listing. `title` is
     /// public, so it must say nothing an attacker could use: the real claim lives in the row.
     /// `max_rooms` caps sybil buyers: total leak is at most `max_rooms` times the per-room bound.
+    #[payable]
     pub fn list(
         &mut self,
         profile: String,
@@ -178,6 +173,8 @@ impl Darkroom {
         require!(max_rooms > 0, "A listing needs at least one room");
         require!(is_hex(&commitment, COMMITMENT_HEX_LEN), "Bad commitment");
         require!(title.len() <= MAX_TITLE_LEN, "Title too long");
+        require!(profile.len() <= MAX_PROFILE_LEN, "Profile too long");
+        require!(env::attached_deposit() >= LISTING_DEPOSIT, "Attach 0.01 NEAR for storage");
         require!(private_settlement == (bond.0 > 0), "A private listing needs a bond, others none");
         let id = self.next_listing;
         self.next_listing += 1;
@@ -204,8 +201,8 @@ impl Darkroom {
         self.pay(buyer, bond);
     }
 
-    /// A buyer who took a price and never paid loses the bond. It stays below the seller's
-    /// reserve, so a seller always earns more by sweeping than by stalling until this.
+    /// A buyer who took a price and never paid loses the bond. Paying needs nothing from the
+    /// seller, and the room's receipt returns the bond, so an honest buyer never reaches this.
     pub fn forfeit(&mut self, listing_id: u64, buyer: AccountId) {
         let room = self.rooms.get(&(listing_id, buyer.clone())).expect("No room");
         require!(matches!(room.status, Status::Deal { .. }) && !room.bond_done, "No bond to take");
@@ -215,20 +212,11 @@ impl Darkroom {
         self.pay(seller, bond);
     }
 
-    /// Posts the sealed Gloam payment, so the seller can sweep and anyone can run the reveal.
-    pub fn post_ticket(&mut self, listing_id: u64, ticket: String) {
-        require!(self.listings.get(&listing_id).expect("No such listing").private_settlement, "Listing is not private");
-        require!(ticket.len() <= MAX_TICKET_LEN, "Ticket too long");
-        let room = self.rooms.get_mut(&(listing_id, env::predecessor_account_id())).expect("No room");
-        require!(matches!(room.status, Status::Deal { .. }), "No deal to pay for");
-        room.ticket = ticket;
-    }
-
     /// Moves a funded room to `Running` for a relayed run. The relayer is untrusted: it can only
     /// deliver a verdict the enclave signed, and if it stays silent `refund_stale` frees the budget.
     pub fn start_room(&mut self, listing_id: u64) {
         let buyer = env::predecessor_account_id();
-        self.mark_running(listing_id, &buyer);
+        self.mark_running(listing_id, &buyer, "relay");
     }
 
     /// The yield/resume door: the contract asks OutLayer directly and the callback settles.
@@ -237,7 +225,9 @@ impl Darkroom {
     pub fn open_room(&mut self, listing_id: u64) -> Promise {
         require!(env::attached_deposit() >= MIN_RUN_DEPOSIT, "Attach at least 0.1 NEAR");
         let buyer = env::predecessor_account_id();
-        let secrets = self.mark_running(listing_id, &buyer);
+        // The room's key for sealed limits is the relayer's, so private rooms keep to that door.
+        require!(!self.listings.get(&listing_id).expect("No such listing").private_settlement, "Private listings run through the relayer");
+        let secrets = self.mark_running(listing_id, &buyer, "chain");
         let input = json!({ "op": "negotiate", "listing_id": listing_id, "buyer": buyer });
 
         self.request_run(input, Some(secrets), buyer.clone()).then(
@@ -256,18 +246,17 @@ impl Darkroom {
         price: u64,
         ct_ref: String,
         ct_hash: String,
-        terms: String,
         sig: String,
     ) {
         let room = self.rooms.get(&(listing_id, buyer.clone())).expect("No room");
         require!(room.status == Status::Running, "Room is not running");
         let message = format!(
-            "darkroom-v1|{}|{listing_id}|{buyer}|{deal}|{price}|{ct_ref}|{ct_hash}|{terms}",
+            "darkroom-v1|{}|{listing_id}|{buyer}|{deal}|{price}|{ct_ref}|{ct_hash}",
             env::current_account_id()
         );
         let sig: [u8; 64] = hex::decode(&sig).ok().and_then(|s| s.try_into().ok()).expect("Bad signature");
         require!(env::ed25519_verify(&sig, message.as_bytes(), &self.enclave_key), "Bad signature");
-        let verdict = json!({ "deal": deal, "price": price, "ct_ref": ct_ref, "ct_hash": ct_hash, "terms": terms });
+        let verdict = json!({ "deal": deal, "price": price, "ct_ref": ct_ref, "ct_hash": ct_hash });
         self.settle(listing_id, buyer, verdict);
     }
 
@@ -311,6 +300,8 @@ impl Darkroom {
         require!(room.status == Status::Funded, "Room already used");
         room.status = Status::Cancelled;
         let cap = room.cap.0;
+        // A cancelled room frees its slot. The room itself stays, so a buyer gets one try.
+        self.listings.get_mut(&listing_id).expect("No such listing").rooms_opened -= 1;
         self.pay(buyer, cap);
     }
 
@@ -362,7 +353,8 @@ impl Darkroom {
     }
 
     fn add_room(&mut self, buyer: AccountId, open: OpenMsg, cap: U128) {
-        require!(cap.0 > 0, "Empty budget");
+        // A dust room would burn a slot and model calls for nothing.
+        require!(cap.0 >= USDC as u128, "Budget below the lowest price");
         // The room's schema carries prices as u64.
         require!(cap.0 <= u64::MAX as u128, "Budget too large");
         require!(is_hex(&open.buyer_pubkey, X25519_KEY_HEX_LEN), "Bad buyer key");
@@ -389,19 +381,19 @@ impl Darkroom {
                 protected_value: open.protected_value,
                 status: Status::Funded,
                 opened_at: 0,
-                terms: String::new(),
+                door: String::new(),
                 mandate,
                 bond_done: !private,
-                ticket: String::new(),
             },
         );
     }
 
-    fn mark_running(&mut self, listing_id: u64, buyer: &AccountId) -> Value {
+    fn mark_running(&mut self, listing_id: u64, buyer: &AccountId, door: &str) -> Value {
         let listing = self.listings.get(&listing_id).expect("No such listing").clone();
         let room = self.rooms.get_mut(&(listing_id, buyer.clone())).expect("Fund the room first");
         require!(room.status == Status::Funded, "Room already used");
         room.status = Status::Running;
+        room.door = door.to_string();
         room.opened_at = env::block_height();
         json!({ "profile": listing.profile, "account_id": listing.seller })
     }
@@ -427,7 +419,6 @@ impl Darkroom {
                     ct_ref: verdict.ct_ref,
                     ct_hash: verdict.ct_hash,
                 };
-                room.terms = verdict.terms;
                 // The pay window runs from here. A private bond stays until paid or forfeited.
                 room.opened_at = env::block_height();
                 if !private {
@@ -495,7 +486,7 @@ mod tests {
 
     fn signed(key: &ed25519_dalek::SigningKey, listing: u64, buyer: &str, deal: bool, price: u64) -> String {
         use ed25519_dalek::Signer;
-        let message = format!("darkroom-v1|darkroom|{listing}|{buyer}|{deal}|{price}|r|h|");
+        let message = format!("darkroom-v1|darkroom|{listing}|{buyer}|{deal}|{price}|r|h");
         hex::encode(key.sign(message.as_bytes()).to_bytes())
     }
 
@@ -592,7 +583,7 @@ mod tests {
         let mut c = started();
         let sig = signed(&signing_key(), 0, "buyer", true, 5_000_000);
         as_caller("anyone");
-        c.settle_signed(0, acct("buyer"), true, 5_000_000, "r".into(), "h".into(), String::new(), sig);
+        c.settle_signed(0, acct("buyer"), true, 5_000_000, "r".into(), "h".into(), sig);
         assert_eq!(status(&c), Status::Deal { price: U128(5_000_000), ct_ref: "r".into(), ct_hash: "h".into() });
     }
 
@@ -600,7 +591,7 @@ mod tests {
     fn a_signed_no_deal_refunds() {
         let mut c = started();
         let sig = signed(&signing_key(), 0, "buyer", false, 0);
-        c.settle_signed(0, acct("buyer"), false, 0, "r".into(), "h".into(), String::new(), sig);
+        c.settle_signed(0, acct("buyer"), false, 0, "r".into(), "h".into(), sig);
         assert_eq!(status(&c), Status::NoDeal);
     }
 
@@ -610,7 +601,7 @@ mod tests {
         let mut c = started();
         let forger = ed25519_dalek::SigningKey::from_bytes(&[4; 32]);
         let sig = signed(&forger, 0, "buyer", true, 5_000_000);
-        c.settle_signed(0, acct("buyer"), true, 5_000_000, "r".into(), "h".into(), String::new(), sig);
+        c.settle_signed(0, acct("buyer"), true, 5_000_000, "r".into(), "h".into(), sig);
     }
 
     #[test]
@@ -618,7 +609,7 @@ mod tests {
     fn a_relayer_cannot_change_the_price() {
         let mut c = started();
         let sig = signed(&signing_key(), 0, "buyer", true, 5_000_000);
-        c.settle_signed(0, acct("buyer"), true, 20_000_000, "r".into(), "h".into(), String::new(), sig);
+        c.settle_signed(0, acct("buyer"), true, 20_000_000, "r".into(), "h".into(), sig);
     }
 
     #[test]
@@ -626,7 +617,7 @@ mod tests {
     fn a_relayer_cannot_flip_a_no_deal_into_a_deal() {
         let mut c = started();
         let sig = signed(&signing_key(), 0, "buyer", false, 0);
-        c.settle_signed(0, acct("buyer"), true, 0, "r".into(), "h".into(), String::new(), sig);
+        c.settle_signed(0, acct("buyer"), true, 0, "r".into(), "h".into(), sig);
     }
 
     #[test]
@@ -638,7 +629,7 @@ mod tests {
         as_caller("rival");
         c.start_room(0);
         let sig = signed(&signing_key(), 0, "buyer", true, 5_000_000);
-        c.settle_signed(0, acct("rival"), true, 5_000_000, "r".into(), "h".into(), String::new(), sig);
+        c.settle_signed(0, acct("rival"), true, 5_000_000, "r".into(), "h".into(), sig);
     }
 
     #[test]
@@ -646,8 +637,8 @@ mod tests {
     fn a_signature_cannot_settle_twice() {
         let mut c = started();
         let sig = signed(&signing_key(), 0, "buyer", true, 5_000_000);
-        c.settle_signed(0, acct("buyer"), true, 5_000_000, "r".into(), "h".into(), String::new(), sig.clone());
-        c.settle_signed(0, acct("buyer"), true, 5_000_000, "r".into(), "h".into(), String::new(), sig);
+        c.settle_signed(0, acct("buyer"), true, 5_000_000, "r".into(), "h".into(), sig.clone());
+        c.settle_signed(0, acct("buyer"), true, 5_000_000, "r".into(), "h".into(), sig);
     }
 
     #[test]
@@ -655,14 +646,14 @@ mod tests {
     fn a_funded_room_cannot_settle_before_it_starts() {
         let mut c = funded();
         let sig = signed(&signing_key(), 0, "buyer", true, 5_000_000);
-        c.settle_signed(0, acct("buyer"), true, 5_000_000, "r".into(), "h".into(), String::new(), sig);
+        c.settle_signed(0, acct("buyer"), true, 5_000_000, "r".into(), "h".into(), sig);
     }
 
     #[test]
     fn a_signed_price_off_bucket_or_over_cap_still_refunds() {
         let mut c = started();
         let sig = signed(&signing_key(), 0, "buyer", true, 7_000_000);
-        c.settle_signed(0, acct("buyer"), true, 7_000_000, "r".into(), "h".into(), String::new(), sig);
+        c.settle_signed(0, acct("buyer"), true, 7_000_000, "r".into(), "h".into(), sig);
         assert_eq!(status(&c), Status::NoDeal);
     }
 
@@ -690,7 +681,7 @@ mod tests {
         let mut c = funded();
         c.list("p".to_string(), "t".to_string(), 3, COMMITMENT.to_string(), Some(acct("owner")), false, U128(0));
         as_caller("usdc");
-        c.ft_on_transfer(acct("attacker"), U128(10), open_msg(1));
+        c.ft_on_transfer(acct("attacker"), U128(USDC as u128), open_msg(1));
     }
 
     #[test]
@@ -698,7 +689,7 @@ mod tests {
         let mut c = funded();
         c.list("p".to_string(), "t".to_string(), 3, COMMITMENT.to_string(), Some(acct("owner")), false, U128(0));
         as_caller("usdc");
-        c.ft_on_transfer(acct("owner"), U128(10), open_msg(1));
+        c.ft_on_transfer(acct("owner"), U128(USDC as u128), open_msg(1));
         assert_eq!(c.get_room(1, acct("owner")).unwrap().status, Status::Funded);
     }
 
@@ -713,8 +704,8 @@ mod tests {
     #[should_panic(expected = "Listing has no rooms left")]
     fn sybil_buyers_run_out_of_rooms() {
         let mut c = funded();
-        c.ft_on_transfer(acct("sybil1"), U128(10), open_msg(0));
-        c.ft_on_transfer(acct("sybil2"), U128(10), open_msg(0));
+        c.ft_on_transfer(acct("sybil1"), U128(USDC as u128), open_msg(0));
+        c.ft_on_transfer(acct("sybil2"), U128(USDC as u128), open_msg(0));
     }
 
     #[test]
@@ -722,7 +713,7 @@ mod tests {
     fn rejects_a_malformed_buyer_key() {
         let mut c = funded();
         let msg = json!({ "listing_id": 0, "buyer_pubkey": "nope", "protected_value": 1 }).to_string();
-        c.ft_on_transfer(acct("other"), U128(10), msg);
+        c.ft_on_transfer(acct("other"), U128(USDC as u128), msg);
     }
 
     #[test]
@@ -730,14 +721,14 @@ mod tests {
     fn rejects_other_tokens() {
         let mut c = funded();
         as_caller("fake-usdc");
-        c.ft_on_transfer(acct("other"), U128(10), open_msg(0));
+        c.ft_on_transfer(acct("other"), U128(USDC as u128), open_msg(0));
     }
 
     #[test]
     #[should_panic(expected = "One room per buyer per listing")]
     fn one_room_per_buyer() {
         let mut c = funded();
-        c.ft_on_transfer(acct("buyer"), U128(10), open_msg(0));
+        c.ft_on_transfer(acct("buyer"), U128(USDC as u128), open_msg(0));
     }
 
     #[test]
@@ -835,14 +826,9 @@ mod tests {
         hex::encode(signing_key().sign(message.as_bytes()).to_bytes())
     }
 
-    fn signed_terms(terms: &str) -> String {
-        sign_text(format!("darkroom-v1|darkroom|0|buyer|true|0|r|h|{terms}"))
-    }
-
     fn private_deal() -> Darkroom {
         let mut c = private_room();
-        let terms = "cd".repeat(TERMS_HEX_LEN / 2);
-        c.settle_signed(0, acct("buyer"), true, 0, "r".into(), "h".into(), terms.clone(), signed_terms(&terms));
+        c.settle_signed(0, acct("buyer"), true, 0, "r".into(), "h".into(), sign_text("darkroom-v1|darkroom|0|buyer|true|0|r|h".to_string()));
         c
     }
 
@@ -870,12 +856,58 @@ mod tests {
     }
 
     #[test]
-    fn private_terms_of_another_size_are_no_deal_and_refund_the_bond() {
+    fn a_priced_private_verdict_is_no_deal_and_refunds_the_bond() {
         let mut c = private_room();
-        let terms = "cd".repeat(10);
-        c.settle_signed(0, acct("buyer"), true, 0, "r".into(), "h".into(), terms.clone(), signed_terms(&terms));
+        let sig = sign_text("darkroom-v1|darkroom|0|buyer|true|5000000|r|h".to_string());
+        c.settle_signed(0, acct("buyer"), true, 5_000_000, "r".into(), "h".into(), sig);
         assert_eq!(c.get_room(0, acct("buyer")).unwrap().status, Status::NoDeal);
         assert_eq!(payouts(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "Private listings run through the relayer")]
+    fn a_private_room_has_one_door() {
+        as_caller("seller");
+        let mut c = Darkroom::new(acct("outlayer"), "o/room".to_string(), acct("usdc"), hex::encode(signing_key().verifying_key().to_bytes()));
+        c.list("p".to_string(), "t".to_string(), 3, COMMITMENT.to_string(), None, true, U128(BOND));
+        as_caller("usdc");
+        c.ft_on_transfer(acct("buyer"), U128(BOND), sealed_msg(0));
+        as_caller("buyer");
+        c.open_room(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Budget below the lowest price")]
+    fn a_dust_room_is_refused() {
+        let mut c = funded();
+        as_caller("usdc");
+        c.ft_on_transfer(acct("rival"), U128(1), open_msg(0));
+    }
+
+    #[test]
+    #[should_panic(expected = "Profile too long")]
+    fn a_huge_profile_is_refused() {
+        as_caller("seller");
+        let mut c = Darkroom::new(acct("outlayer"), "o/room".to_string(), acct("usdc"), hex::encode(signing_key().verifying_key().to_bytes()));
+        c.list("p".repeat(290_000), "t".to_string(), 3, COMMITMENT.to_string(), None, false, U128(0));
+    }
+
+    #[test]
+    fn a_cancelled_room_frees_its_slot() {
+        let mut c = funded();
+        as_caller("buyer");
+        c.cancel(0);
+        assert_eq!(c.get_listing(0).unwrap().rooms_opened, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "One room per buyer per listing")]
+    fn a_cancelled_buyer_gets_no_second_room() {
+        let mut c = funded();
+        as_caller("buyer");
+        c.cancel(0);
+        as_caller("usdc");
+        c.ft_on_transfer(acct("buyer"), U128(USDC as u128), open_msg(0));
     }
 
     #[test]
@@ -922,7 +954,7 @@ mod tests {
     fn a_public_deal_has_no_bond_to_take() {
         let mut c = started();
         let sig = signed(&signing_key(), 0, "buyer", true, 5_000_000);
-        c.settle_signed(0, acct("buyer"), true, 5_000_000, "r".into(), "h".into(), String::new(), sig);
+        c.settle_signed(0, acct("buyer"), true, 5_000_000, "r".into(), "h".into(), sig);
         at_block(PAY_WINDOW_BLOCKS + 1);
         c.forfeit(0, acct("buyer"));
     }
@@ -953,10 +985,4 @@ mod tests {
         c.ft_on_transfer(acct("rival"), U128(BOND), sealed_msg(0));
     }
 
-    #[test]
-    #[should_panic(expected = "No deal to pay for")]
-    fn a_ticket_needs_a_deal() {
-        let mut c = private_room();
-        c.post_ticket(0, "gloam2t.x".into());
-    }
 }

@@ -17,6 +17,8 @@ const env = (name: string) => {
 const USDC = 1_000_000;
 const KEY_DIR = join(homedir(), ".darkroom");
 const keyPath = (listing: number, account: string) => join(KEY_DIR, `${listing}-${account}.json`);
+const paymentPath = (ctRef: string) => join(KEY_DIR, `paid-${ctRef}.tx`);
+const sellerSeedPath = (listing: number) => join(KEY_DIR, `seller-${listing}.seed`);
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function sellerList(o: Record<string, any>) {
@@ -32,12 +34,8 @@ async function sellerList(o: Record<string, any>) {
     DARKROOM_TITLE: o["private-title"] ?? o.title,
   };
   const privateSettlement = Boolean(o.private);
-  const keys = privateSettlement ? JSON.parse(gloam("keygen")) : null;
-  if (keys) {
-    row.DARKROOM_GLOAM_KEY = keys.key_hex;
-    row.DARKROOM_GLOAM_SWEEP = keys.sweep_hex;
-    row.DARKROOM_GLOAM_TAG = keys.tag;
-  }
+  const payeeSeed = randomBytes(32).toString("hex");
+  if (privateSettlement) row.DARKROOM_PAYEE_SEED = payeeSeed;
   // Encrypted on this machine by the outlayer CLI. Only this build, started by the contract or
   // the relayer, can read the row, and the room checks the commitment and the chain itself.
   const stored = spawnSync(
@@ -49,10 +47,10 @@ async function sellerList(o: Record<string, any>) {
   if (stored.status !== 0) throw new Error(`outlayer secrets set failed:\n${stored.stderr.slice(-400)}`);
   const id = await view(contract, "listing_count", {});
   const args = { profile, title: o.title, max_rooms: Number(o["max-rooms"] ?? 3), commitment, target: o.target ?? null, private_settlement: privateSettlement, bond: privateSettlement ? String(Number(o.bond ?? 1) * USDC) : "0" };
-  call(o.as, contract, "list", args, "0 NEAR");
-  if (keys) {
+  call(o.as, contract, "list", args, "0.01 NEAR");
+  if (privateSettlement) {
     mkdirSync(KEY_DIR, { recursive: true, mode: 0o700 });
-    writeFileSync(join(KEY_DIR, `seller-${id}.json`), JSON.stringify(keys), { mode: 0o600 });
+    writeFileSync(sellerSeedPath(id), payeeSeed, { mode: 0o600 });
   }
   console.log(`listed as ${id}, commitment ${commitment}`);
 }
@@ -115,7 +113,7 @@ async function buyerOpen(o: Record<string, any>) {
     if (isPrivate) {
       const keys = await callRoom({ op: "public_key" });
       const roomKey = checkRoomKey(contract, keys, await view(contract, "get_enclave_key", {}));
-      open.sealed_mandate = sealMandate(roomKey, amount, BigInt(o.protects ?? 0));
+      open.sealed_mandate = sealMandate(roomKey, amount, BigInt(o.protects ?? 0), `${listing}-${o.as}`);
       open.protected_value = 0;
     }
     const transfer = isPrivate ? bond : amount.toString();
@@ -152,7 +150,7 @@ async function relay(listing: number, buyer: string) {
   );
   const output = call(buyer, contract, "settle_signed", {
     listing_id: listing, buyer, deal: verdict.deal, price: verdict.price,
-    ct_ref: verdict.ct_ref, ct_hash: verdict.ct_hash, terms: verdict.terms, sig: verdict.sig,
+    ct_ref: verdict.ct_ref, ct_hash: verdict.ct_hash, sig: verdict.sig,
   }, "0 NEAR");
   console.log(`settle_signed tx ${output.match(/Transaction ID: (\S+)/)?.[1]}`);
 }
@@ -188,32 +186,42 @@ async function printStatus(listing: number, buyer: string) {
   const room = await waitForOutcome(listing, buyer);
   if (room.status === "Funded") console.log("funded, not started: run buyer open again, or buyer cancel");
   else if (room.status === "NoDeal") console.log("no deal: any escrow is refunded, and you learned nothing else");
-  else if (room.status.Deal && room.terms) console.log("deal, price sealed to you. Run: buyer pay");
+  else if (room.status.Deal && room.mandate) console.log("deal, price sealed to you. Run: buyer pay");
   else if (room.status.Deal) console.log(`deal at ${Number(room.status.Deal.price) / USDC} USDC. Run: buyer fetch`);
   else console.log(JSON.stringify(room.status));
 }
 
-/// Pays the sealed terms through Gloam, then posts the ticket. Neither shows on NEAR.
+async function readPublic(key: string) {
+  const url = `${env("OUTLAYER_API")}/public/storage/get?project=${encodeURIComponent(env("DARKROOM_PROJECT"))}`
+    + `&key=${encodeURIComponent(key)}&format=raw`;
+  for (let i = 0; i < 60; i++) {
+    const response = await fetch(url);
+    if (response.ok) return new Uint8Array(await response.arrayBuffer());
+    await sleep(2000);
+  }
+  throw new Error(`${key} is not published yet. It is safe to retry`);
+}
+
+/// Reads the sealed price, which the room releases only after the chain records the deal, then
+/// pays through Gloam. The payment's hash stays off NEAR, so nothing there points to it.
 async function buyerPay(o: Record<string, any>) {
   const contract = env("DARKROOM_CONTRACT");
   const listing = Number(o.listing);
   const room = await view(contract, "get_room", { listing_id: listing, buyer: o.as });
-  if (!room?.terms) throw new Error("No private deal on this listing");
+  if (!room?.mandate || !room.status?.Deal) throw new Error("No private deal on this listing");
+  const ctRef = room.status.Deal.ct_ref;
+  await callRoom({ op: "terms", listing_id: listing, buyer: o.as });
   const { secret } = JSON.parse(readFileSync(keyPath(listing, o.as), "utf8"));
-  const terms = JSON.parse(new TextDecoder().decode(openDelivery(secret, Buffer.from(room.terms, "hex"))));
+  const terms = JSON.parse(new TextDecoder().decode(openDelivery(secret, await readPublic(`terms:${ctRef}`))));
   console.log(`sealed terms: ${Number(terms.price) / USDC} USDC`);
-  const ticket = gloam("pay", terms.pay_to, String(terms.price), room.status.Deal.ct_ref, `${o.as}-${listing}`).trim();
-  call(o.as, contract, "post_ticket", { listing_id: listing, ticket }, "0 NEAR");
-  console.log("paid. Ticket posted, waiting for the seller to sweep");
+  const tx = gloam("pay", terms.pay_to, String(terms.price), ctRef, o.as).trim();
+  writeFileSync(paymentPath(ctRef), tx, { mode: 0o600 });
+  console.log("paid. The payment is final. Run: buyer fetch");
 }
 
-/// Takes the payment. Until this runs the buyer can still spend it back, so the room waits for it.
-async function sellerSweep(o: Record<string, any>) {
-  const listing = Number(o.listing);
-  const room = await view(env("DARKROOM_CONTRACT"), "get_room", { listing_id: listing, buyer: o.buyer });
-  if (!room?.ticket) throw new Error("No ticket posted yet");
-  const keyFile = join(KEY_DIR, `seller-${listing}.json`);
-  console.log(gloam("sweep", room.ticket, keyFile, room.status.Deal.ct_ref, `${o.as}-${listing}`).trim());
+async function sellerPaid(o: Record<string, any>) {
+  const seed = readFileSync(sellerSeedPath(Number(o.listing)), "utf8");
+  console.log(gloam("balance", seed, `${o.listing}-${o.buyer}`).trim());
 }
 
 async function buyerFetch(o: Record<string, any>) {
@@ -221,25 +229,23 @@ async function buyerFetch(o: Record<string, any>) {
   const listing = Number(o.listing);
   const room = await view(contract, "get_room", { listing_id: listing, buyer: o.as });
   if (!room?.status?.Deal) throw new Error("No deal on this listing");
+  const ctRef = room.status.Deal.ct_ref;
   const { secret } = JSON.parse(readFileSync(keyPath(listing, o.as), "utf8"));
-  const url = `${env("OUTLAYER_API")}/public/storage/get?project=${encodeURIComponent(env("DARKROOM_PROJECT"))}`
-    + `&key=${encodeURIComponent(`reveal:${room.status.Deal.ct_ref}`)}&format=raw`;
-
+  let paidSig: string | undefined;
   if (o.door === "chain") call(o.as, contract, "reveal", { listing_id: listing }, "0.1 NEAR");
   else {
-    const out = await callRoom({ op: "reveal", listing_id: listing, buyer: o.as });
-    if (out.paid_sig) call(o.as, contract, "confirm_paid", { listing_id: listing, buyer: o.as, sig: out.paid_sig }, "0 NEAR");
+    const tx = o.tx ?? (existsSync(paymentPath(ctRef)) ? readFileSync(paymentPath(ctRef), "utf8") : undefined);
+    paidSig = (await callRoom({ op: "reveal", listing_id: listing, buyer: o.as, ...(tx ? { tx } : {}) })).paid_sig;
   }
-  for (let i = 0; i < 60; i++) {
-    const response = await fetch(url);
-    if (response.ok) {
-      const sealed = new Uint8Array(await response.arrayBuffer());
-      process.stdout.write(new TextDecoder().decode(openDelivery(secret, sealed)));
-      return;
+  process.stdout.write(new TextDecoder().decode(openDelivery(secret, await readPublic(`reveal:${ctRef}`))));
+  // After the secret is out: a failure here costs at most the bond, never what was paid for.
+  if (paidSig) {
+    try {
+      call(o.as, contract, "confirm_paid", { listing_id: listing, buyer: o.as, sig: paidSig }, "0 NEAR");
+    } catch (error: any) {
+      console.error(`Bond not returned: ${error.message.slice(-160)}`);
     }
-    await sleep(2000);
   }
-  throw new Error("Reveal not published yet. Run buyer fetch again: it is safe to retry");
 }
 
 function wasmManifest(wasm: Buffer) {
@@ -318,6 +324,11 @@ async function verifyCall(o: Record<string, any>) {
   console.log(`wasm ${a.executed_wasm_sha256}, project ${a.project_id}`);
   console.log(`${computed === inQuote ? "ok  " : "FAIL"} quote commits to this wasm, input and output`);
   if (computed !== inQuote) process.exit(1);
+  const expected = process.env.DARKROOM_WASM_HASH;
+  if (expected && a.executed_wasm_sha256 !== expected) {
+    console.log(`FAIL the run used ${a.executed_wasm_sha256}, not the published ${expected}`);
+    process.exit(1);
+  }
 
   // Intel's signature chain and the approved worker builds, from outside OutLayer's API.
   const file = join(tmpdir(), `darkroom-quote-${o.call}.hex`);
@@ -333,7 +344,8 @@ async function verifyCall(o: Record<string, any>) {
   const approved: any[] = await view(env("OUTLAYER_REGISTER"), "get_approved_measurements", {});
   const known = approved.some((m) => m.mrtd === report.mr_td && m.rtmr0 === report.rtmr0
     && m.rtmr1 === report.rtmr1 && m.rtmr2 === report.rtmr2);
-  console.log(`${known ? "ok  " : "WARN"} worker build ${known ? "is" : "is not"} on OutLayer's on-chain approved list (${approved.length} builds)`);
+  console.log(`${known ? "ok  " : "FAIL"} worker build ${known ? "is" : "is not"} on OutLayer's on-chain approved list (${approved.length} builds)`);
+  if (!known) process.exit(1);
 }
 
 /// Checks that a model really runs in a TEE, before its URL is compiled into the room. Needs no
@@ -367,8 +379,11 @@ async function verifyModel(o: Record<string, any>) {
       headers: { "content-type": "application/json" },
       body: typeof a.nvidia_payload === "string" ? a.nvidia_payload : JSON.stringify(a.nvidia_payload),
     });
-    console.log(`${gpu.ok ? "ok  " : "FAIL"} NVIDIA attestation service answered ${gpu.status}`);
-    if (!gpu.ok) process.exit(1);
+    // The service answers with signed claims. A 200 alone can carry a failed result.
+    const claims = gpu.ok ? JSON.parse(atob((await gpu.json())[0][1].split(".")[1].replace(/-/g, "+").replace(/_/g, "/"))) : {};
+    const passed = claims["x-nvidia-overall-att-result"] === true;
+    console.log(`${passed ? "ok  " : "FAIL"} NVIDIA attestation result: ${passed}`);
+    if (!passed) process.exit(1);
   }
 }
 
@@ -378,14 +393,14 @@ async function main() {
     args: process.argv.slice(2),
     allowPositionals: true,
     options: Object.fromEntries(
-      ["as", "buyer", "bond", "model", "url", "title", "private-title", "target", "secret-file", "reserve", "max-rooms", "listing", "budget", "protects", "door", "tx", "wasm", "signer", "call"]
+      ["as", "buyer", "bond", "tx", "model", "url", "title", "private-title", "target", "secret-file", "reserve", "max-rooms", "listing", "budget", "protects", "door", "tx", "wasm", "signer", "call"]
         .map((name) => [name, { type: "string" as const }])
         .concat([["private", { type: "boolean" as const }]] as any),
     ),
   });
   if (group === "seller" && verb === "list") return sellerList(values);
   if (group === "seller" && verb === "forfeit") return sellerForfeit(values);
-  if (group === "seller" && verb === "sweep") return sellerSweep(values);
+  if (group === "seller" && verb === "paid") return sellerPaid(values);
   if (group === "buyer" && verb === "pay") return buyerPay(values);
   if (group === "buyer" && verb === "open") return buyerOpen(values);
   if (group === "buyer" && verb === "fetch") return buyerFetch(values);
@@ -398,12 +413,12 @@ async function main() {
   console.log(`usage:
   darkroom seller list --as <account> --title <public label> --secret-file <path> --reserve <usdc>
       [--private-title <claim only agents see>] [--target <only allowed buyer>] [--max-rooms <n>]
-      [--private] [--bond <usdc, below the reserve>]   settle through Gloam: the chain sees no price, payee or limit
-  darkroom seller sweep --as <account> --listing <id> --buyer <account>
+      [--private] [--bond <usdc, below the reserve>]   pay through Gloam: NEAR sees no price, payee or limit
+  darkroom seller paid --listing <id> --buyer <account>
   darkroom seller forfeit --as <account> --listing <id> --buyer <account>
   darkroom buyer pay --as <account> --listing <id>
   darkroom buyer open --as <account> --listing <id> --budget <usdc> [--protects <usdc at risk>] [--door chain]
-  darkroom buyer fetch --as <account> --listing <id> [--door chain]
+  darkroom buyer fetch --as <account> --listing <id> [--door chain] [--tx <Tempo payment>]
   darkroom buyer cancel --as <account> --listing <id>
   darkroom buyer refund --as <account> --listing <id>
   darkroom status --as <account> --listing <id>

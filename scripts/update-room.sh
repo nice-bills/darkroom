@@ -7,7 +7,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 set -a; source .env; set +a
 export PATH="$HOME/.local/bin:$PATH"
-export DARKROOM_CONTRACT=room.$NEAR_ACCOUNT_ID
+export DARKROOM_CONTRACT=market.$NEAR_ACCOUNT_ID
 PROJECT=$NEAR_ACCOUNT_ID/room
 retry() { for attempt in 1 2 3 4; do "$@" && return 0; sleep $((attempt * 5)); done; return 1; }
 
@@ -15,9 +15,6 @@ enclave/room/build.sh >/dev/null
 WASM=enclave/room/target/wasm32-wasip2/release/room.wasm
 HASH=$(sha256sum "$WASM" | cut -d' ' -f1)
 URL=${ROOM_WASM_URL:-}
-if [ "${ROOM_WASM_HOST:-}" = uguu ]; then
-  URL=$(curl -sS -m 60 -F "files[]=@$WASM;filename=room.wasm" https://uguu.se/upload | python3 -I -c "import sys,json;print(json.load(sys.stdin)['files'][0]['url'])")
-fi
 if [ "${ROOM_WASM_HOST:-}" = walrus ]; then
   BLOB=$(curl -sS -m 90 -X PUT "https://publisher.walrus-testnet.walrus.space/v1/blobs?epochs=50&permanent=true" --upload-file "$WASM" | python3 -I -c "import sys,json;d=json.load(sys.stdin);print(d['newlyCreated']['blobObject']['blobId'] if 'newlyCreated' in d else d['alreadyCertified']['blobId'])")
   URL=https://aggregator.walrus-testnet.walrus.space/v1/blobs/$BLOB
@@ -28,6 +25,8 @@ fi
 sleep 5
 retry outlayer deploy room "$URL" --hash "$HASH"
 sleep 5
-retry outlayer secrets set "{\"LLM_API_KEY\":\"$LLM_API_KEY\"}" --profile llm --project "$PROJECT" --access allow-all --build "$HASH" --via "$DARKROOM_CONTRACT,$NEAR_ACCOUNT_ID"
+# Seals every deal, so it must survive new builds. Stays in .room-key, gitignored.
+[ -f .room-key ] || (umask 077; openssl rand -hex 32 > .room-key)
+retry outlayer secrets set "{\"LLM_API_KEY\":\"$LLM_API_KEY\",\"DARKROOM_ROOM_KEY\":\"$(cat .room-key)\"}" --profile llm --project "$PROJECT" --access allow-all --build "$HASH" --via "$DARKROOM_CONTRACT,$NEAR_ACCOUNT_ID"
 if [ -f .darkroom.env ]; then sed -i "s/^DARKROOM_WASM_HASH=.*/DARKROOM_WASM_HASH=$HASH/" .darkroom.env; fi
 echo "$HASH"

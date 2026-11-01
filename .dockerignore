@@ -4,3 +4,6 @@
 **/target
 **/node_modules
 submission*.json
+redteam/live-run.log
+redteam/results-live.json
+.room-key

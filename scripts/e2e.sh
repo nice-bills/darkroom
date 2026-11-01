@@ -32,7 +32,10 @@ echo "== payment settled, so the secret is released to the buyer's key:"
 darkroom buyer fetch --as "$BUYER" --listing "$LISTING" ${DOOR:+--door "$DOOR"}
 if [ "${DOOR:-}" = chain ]; then
   echo "== the contract asked OutLayer for exactly this wasm:"
-  darkroom verify --tx "$(echo "$OUT" | grep -oE 'open_room tx [A-Za-z0-9]+' | cut -d' ' -f3)" --signer "$BUYER" --wasm enclave/room/target/wasm32-wasip2/release/room.wasm
+  WASM=enclave/room/target/wasm32-wasip2/release/room.wasm
+  # The hosted relay has no local build to compare with.
+  [ -f "$WASM" ] || exit 0
+  darkroom verify --tx "$(echo "$OUT" | grep -oE 'open_room tx [A-Za-z0-9]+' | cut -d' ' -f3)" --signer "$BUYER" --wasm "$WASM"
   exit 0
 fi
 echo "== the TDX quote commits to this wasm, input and output:"

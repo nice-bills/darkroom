@@ -5,7 +5,6 @@ cd "$(dirname "$0")"
 : "${DARKROOM_CONTRACT:?}" "${DARKROOM_LLM_URL:?}" "${DARKROOM_LLM_MODEL:?}" "${DARKROOM_RPC_URL:?}" "${DARKROOM_RPC_URL_2:?}"
 export DARKROOM_VAULT_RPC=${DARKROOM_VAULT_RPC:-https://rpc.moderato.tempo.xyz}
 export DARKROOM_VAULT_RPC_2=${DARKROOM_VAULT_RPC_2:-https://tempo-moderato-testnet.drpc.org}
-export DARKROOM_VAULT_POOL=${DARKROOM_VAULT_POOL:-0x841DC046Ea3CC842BA3A855731472c6Eb0F2d5eb}
 export DARKROOM_VAULT_ASSET=${DARKROOM_VAULT_ASSET:-0x20c0000000000000000000000000000000000000}
 host=$(echo "$DARKROOM_LLM_URL" | sed -E 's#^[a-z]+://([^/:]+).*#\1#')
 rpc_host=$(echo "$DARKROOM_RPC_URL" | sed -E 's#^[a-z]+://([^/:]+).*#\1#')
@@ -23,7 +22,7 @@ BUILD=/tmp/darkroom-build
 rm -rf "$BUILD"
 mkdir -p "$BUILD/enclave/room" "$BUILD/enclave/core"
 cp -r ../../agents "$BUILD/"
-cp -r ../core/src ../core/Cargo.toml ../core/gloam-fixture.json "$BUILD/enclave/core/"
+cp -r ../core/src ../core/Cargo.toml "$BUILD/enclave/core/"
 cp -r src Cargo.toml Cargo.lock manifest.json "$BUILD/enclave/room/"
 export RUSTFLAGS="--remap-path-prefix=$HOME/.cargo=/cargo --remap-path-prefix=$(rustc --print sysroot)=/rust"
 (cd "$BUILD/enclave/room" && cargo build --locked --target wasm32-wasip2 --release)

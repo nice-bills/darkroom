@@ -21,11 +21,13 @@ export function newBuyerKey() {
   return { secret: bytesToHex(secret), pubkey: bytesToHex(x25519.getPublicKey(secret)) };
 }
 
-/// Mirrors `open_mandate` in enclave/core: the limit and value at risk, as two little-endian u64s.
-export function sealMandate(roomKeyHex: string, capMicro: bigint, protectedValue: bigint): string {
-  const numbers = new DataView(new ArrayBuffer(16));
+/// Mirrors `open_mandate` in enclave/core: the limit and value at risk as little-endian u64s, then
+/// the room's hash, so a sealed limit cannot be replayed into another room.
+export function sealMandate(roomKeyHex: string, capMicro: bigint, protectedValue: bigint, ctRef: string): string {
+  const numbers = new DataView(new ArrayBuffer(48));
   numbers.setBigUint64(0, capMicro, true);
   numbers.setBigUint64(8, protectedValue, true);
+  new Uint8Array(numbers.buffer).set(sha256(utf8ToBytes(ctRef)), 16);
   const secret = x25519.utils.randomPrivateKey();
   const shared = x25519.getSharedSecret(secret, hexToBytes(roomKeyHex));
   const key = hkdf(sha256, shared, undefined, INFO, 32);

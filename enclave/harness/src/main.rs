@@ -12,8 +12,8 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use darkroom_core::{gloam, open_delivery, seal_to_buyer, secret_commitment, to_hex, verdict_message, Verdict, USDC};
 use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
-use sha2::Sha256;
-use std::collections::{HashMap, HashSet, VecDeque};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
@@ -32,7 +32,7 @@ const BUYER_SECRET: [u8; 32] = [9; 32];
 const VERDICT_KEY: [u8; 32] = [5; 32];
 const SALT: &str = "0102";
 const CONTRACT: &str = "room.testnet";
-const SWEEP: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+const ASSET: &str = "0x20c0000000000000000000000000000000000000";
 
 #[derive(Default)]
 struct Chain {
@@ -44,11 +44,11 @@ struct Chain {
     /// When set, the second RPC answers `get_room` with this instead.
     lying_room: Option<Value>,
     room_reads: u32,
-    /// Hex words for which the Gloam vault answers true.
-    vault: HashSet<String>,
-    vault_reads: u32,
-    /// When set, every second vault read answers the opposite.
-    lying_vault: bool,
+    /// What Tempo answers for any transaction.
+    receipt: Option<Value>,
+    /// When set, every second receipt read answers this instead.
+    lying_receipt: Option<Value>,
+    receipt_reads: u32,
 }
 
 struct Guest {
@@ -149,6 +149,10 @@ fn link_outlayer(linker: &mut Linker<Guest>, chain: &Arc<Mutex<Chain>>) -> Resul
         Ok(((c.lock().unwrap().private.get(&key).cloned().unwrap_or_default(), String::new()),))
     })?;
     let c = chain.clone();
+    let shared = chain.clone();
+    storage.func_wrap("get-worker", move |_, (key, _project): (String, Option<String>)| {
+        Ok(((shared.lock().unwrap().private.get(&key).cloned().unwrap_or_default(), String::new()),))
+    })?;
     storage.func_wrap("set-worker", move |_, (key, value, encrypted): (String, Vec<u8>, Option<bool>)| {
         let mut chain = c.lock().unwrap();
         if encrypted == Some(false) {
@@ -193,9 +197,8 @@ impl Room {
             .env("DARKROOM_SECRET", std::env::var("HARNESS_SECRET").context("HARNESS_SECRET")?)
             .env("DARKROOM_RESERVE_USDC", "2")
             .env("DARKROOM_TITLE", "Critical drain in the decoy vault")
-            .env("DARKROOM_GLOAM_KEY", fixture()["key_hex"].as_str().unwrap())
-            .env("DARKROOM_GLOAM_SWEEP", SWEEP)
-            .env("DARKROOM_GLOAM_TAG", fixture()["tag"].as_str().unwrap())
+            .env("DARKROOM_PAYEE_SEED", "03".repeat(32))
+            .env("DARKROOM_ROOM_KEY", "04".repeat(32))
             .env("DARKROOM_SALT", std::env::var("HARNESS_SALT").unwrap_or(SALT.to_string()))
             .env("LLM_API_KEY", api_key)
             .build();
@@ -241,12 +244,11 @@ fn mock_services(chain: Arc<Mutex<Chain>>, replies: Arc<Mutex<VecDeque<String>>>
                 body.extend_from_slice(&chunk[..size]);
             }
             let request: Value = serde_json::from_slice(&body).unwrap();
-            let answer = if request["method"] == "eth_call" {
+            let answer = if request["method"] == "eth_getTransactionReceipt" {
                 let mut chain = chain.lock().unwrap();
-                chain.vault_reads += 1;
-                let data = request["params"][0]["data"].as_str().unwrap();
-                let hit = chain.vault.contains(&data[10..]) != (chain.lying_vault && chain.vault_reads % 2 == 0);
-                json!({ "result": format!("0x{}{}", "00".repeat(31), if hit { "01" } else { "00" }) }).to_string()
+                chain.receipt_reads += 1;
+                let lie = chain.lying_receipt.clone().filter(|_| chain.receipt_reads % 2 == 0);
+                json!({ "result": lie.or(chain.receipt.clone()) }).to_string()
             } else if request["method"] == "query" {
                 let mut chain = chain.lock().unwrap();
                 let view = if request["params"]["method_name"] == "get_room" {
@@ -281,10 +283,6 @@ fn check(label: &str, ok: bool) -> Result<()> {
     println!("{} {label}", if ok { "ok  " } else { "FAIL" });
     ensure!(ok, "{label}");
     Ok(())
-}
-
-fn fixture() -> Value {
-    serde_json::from_str(include_str!("../../core/gloam-fixture.json")).unwrap()
 }
 
 fn negotiate_input(listing: u64) -> Value {
@@ -349,7 +347,7 @@ async fn flow(wasm: &str) -> Result<()> {
     check("stdout carries no secret", !out.contains("drain"))?;
 
     let text = |name: &str| verdict[name].as_str().unwrap().to_string();
-    let plain = Verdict { deal: true, price: 10 * USDC, ct_ref: text("ct_ref"), ct_hash: text("ct_hash"), terms: String::new(), sig: String::new() };
+    let plain = Verdict { deal: true, price: 10 * USDC, ct_ref: text("ct_ref"), ct_hash: text("ct_hash"), sig: String::new() };
     let message = verdict_message(CONTRACT, 0, "buyer.testnet", &plain);
     let sig: [u8; 64] = darkroom_core::from_hex(&text("sig")).map_err(|e| anyhow::anyhow!("{e}"))?.try_into().unwrap();
     let signature = ed25519_dalek::Signature::from_bytes(&sig);
@@ -383,10 +381,9 @@ async fn flow(wasm: &str) -> Result<()> {
     private_flow(&room, &chain, &replies, &secret, key).await
 }
 
-/// Private settlement on the real wasm, with a real ticket from a spent testnet payment.
+/// Private settlement on the real wasm, against a mock of Tempo's receipts.
 async fn private_flow(room: &Room, chain: &Arc<Mutex<Chain>>, replies: &Arc<Mutex<VecDeque<String>>>, secret: &str, key: &str) -> Result<()> {
-    let f = fixture();
-    let (commitment, nullifier) = (f["commitment"].as_str().unwrap(), f["nullifier"].as_str().unwrap());
+    let ct_ref = "7-buyer.testnet";
     {
         let mut chain = chain.lock().unwrap();
         chain.listing["private_settlement"] = json!(true);
@@ -396,7 +393,7 @@ async fn private_flow(room: &Room, chain: &Arc<Mutex<Chain>>, replies: &Arc<Mute
     let (out, _) = room.run(&json!({ "op": "public_key" }), key).await?;
     let keys: Value = serde_json::from_str(&out)?;
     let room_key: [u8; 32] = hex::decode(keys["mandate_key"].as_str().unwrap())?.try_into().unwrap();
-    let numbers = [(50 * USDC).to_le_bytes(), 50_000u64.to_le_bytes()].concat();
+    let numbers = [(50 * USDC).to_le_bytes().as_slice(), &50_000u64.to_le_bytes(), &sha2::Sha256::digest(ct_ref.as_bytes())].concat();
     let sealed = seal_to_buyer([4; 32], &room_key, &numbers).map_err(|e| anyhow::anyhow!("{e}"))?;
     {
         let mut chain = chain.lock().unwrap();
@@ -409,37 +406,39 @@ async fn private_flow(room: &Room, chain: &Arc<Mutex<Chain>>, replies: &Arc<Mute
     ]);
     let (out, _) = room.run(&negotiate_input(7), key).await?;
     let verdict: Value = serde_json::from_str(&out)?;
-    check("a private deal shows no price", verdict["deal"] == true && verdict["price"] == 0)?;
-    let terms = open_delivery(BUYER_SECRET, &hex::decode(verdict["terms"].as_str().unwrap())?).context("terms")?;
-    let terms: Value = serde_json::from_slice(&terms)?;
-    check("the buyer alone reads the price and tag", terms["price"] == 5 * USDC && terms["pay_to"] == f["tag"])?;
+    check("a private verdict shows no price", verdict["deal"] == true && verdict["price"] == 0)?;
+    check("terms are refused before the chain records the deal", room.run(&json!({ "op": "terms", "listing_id": 7, "buyer": "buyer.testnet" }), key).await.is_err())?;
 
-    let deal = json!({ "Deal": { "price": "0", "ct_ref": verdict["ct_ref"], "ct_hash": verdict["ct_hash"] } });
-    chain.lock().unwrap().room["status"] = deal;
+    chain.lock().unwrap().room["status"] = json!({ "Deal": { "price": "0", "ct_ref": verdict["ct_ref"], "ct_hash": verdict["ct_hash"] } });
+    room.run(&json!({ "op": "terms", "listing_id": 7, "buyer": "buyer.testnet" }), key).await?;
+    let sealed = chain.lock().unwrap().public["terms:7-buyer.testnet"].clone();
+    let terms: Value = serde_json::from_slice(&open_delivery(BUYER_SECRET, &sealed).context("terms")?)?;
+    let payee = gloam::payee_address(&[3; 32], ct_ref).map_err(|e| anyhow::anyhow!("{e}"))?;
+    check("the buyer alone reads the price and address", terms["price"] == 5 * USDC && terms["pay_to"] == format!("0x{payee}"))?;
+
     let leaked = |chain: &Arc<Mutex<Chain>>| chain.lock().unwrap().public.contains_key("reveal:7-buyer.testnet");
-    check("no ticket, no reveal", room.run(&reveal_input(7), key).await.is_err() && !leaked(chain))?;
+    let tx = format!("0x{}", "11".repeat(32));
+    let reveal = json!({ "op": "reveal", "listing_id": 7, "buyer": "buyer.testnet", "tx": tx });
+    check("no payment, no reveal", room.run(&reveal_input(7), key).await.is_err() && !leaked(chain))?;
 
-    let word = |value: &str| gloam::word_hex(value).unwrap();
-    let swept = gloam::swept_commitment_hex(&hex::decode(SWEEP)?, nullifier, f["amount"].as_str().unwrap(), "0x20c0000000000000000000000000000000000000", "7-buyer.testnet").unwrap();
-    chain.lock().unwrap().room["ticket"] = f["ticket"].clone();
+    let receipt = |to: &str, amount: u64| json!({ "status": "0x1", "logs": [{
+        "address": ASSET,
+        "topics": ["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef", format!("0x{:0>64}", "ab"), format!("0x{to:0>64}")],
+        "data": format!("0x{amount:064x}"),
+    }] });
+    chain.lock().unwrap().receipt = Some(receipt(&payee, 4 * USDC));
+    check("an underpayment is refused", room.run(&reveal, key).await.is_err() && !leaked(chain))?;
+    chain.lock().unwrap().receipt = Some(receipt("beef", 5 * USDC));
+    check("a payment to another address is refused", room.run(&reveal, key).await.is_err() && !leaked(chain))?;
+    chain.lock().unwrap().receipt = Some(receipt(&payee, 5 * USDC));
+    chain.lock().unwrap().lying_receipt = Some(receipt("beef", 5 * USDC));
+    check("one lying Tempo RPC is refused", room.run(&reveal, key).await.is_err() && !leaked(chain))?;
+    chain.lock().unwrap().lying_receipt = None;
 
-    chain.lock().unwrap().vault = [word(commitment)].into();
-    check("an unswept payment is refused", room.run(&reveal_input(7), key).await.is_err() && !leaked(chain))?;
-
-    chain.lock().unwrap().vault = [word(commitment), word(nullifier)].into();
-    check("a buyer who spent it back gets nothing", room.run(&reveal_input(7), key).await.is_err() && !leaked(chain))?;
-
-    chain.lock().unwrap().vault = [word(commitment), word(nullifier), swept].into();
-    chain.lock().unwrap().lying_vault = true;
-    check("one lying vault RPC is refused", room.run(&reveal_input(7), key).await.is_err() && !leaked(chain))?;
-    chain.lock().unwrap().lying_vault = false;
-
-    let (out, _) = room.run(&reveal_input(7), key).await?;
-    println!("     private reveal: {}", &out[..24]);
+    let (out, _) = room.run(&reveal, key).await?;
     check("the room signs that it saw the payment", serde_json::from_str::<Value>(&out)?["paid_sig"].as_str().is_some_and(|s| s.len() == 128))?;
     let delivery = chain.lock().unwrap().public["reveal:7-buyer.testnet"].clone();
-    check("a swept payment releases the exact secret", open_delivery(BUYER_SECRET, &delivery).context("open")? == secret.as_bytes())?;
-    check("the reveal really read the vault", chain.lock().unwrap().vault_reads >= 3)?;
+    check("a final payment releases the exact secret", open_delivery(BUYER_SECRET, &delivery).context("open")? == secret.as_bytes())?;
     Ok(())
 }
 

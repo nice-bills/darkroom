@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Private settlement on testnet, real worker and model: NEAR records a deal with no price and no
-# payee, the buyer pays through Gloam on Tempo, and the room reveals only after the seller sweeps.
+# payee, the buyer pays through Gloam on Tempo, and the room confirms it from two RPCs before it
+# reveals. The seller does nothing after listing.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 set -a; source .env; source .darkroom.env; set +a
@@ -8,6 +9,8 @@ export PATH="$HOME/.local/bin:$PATH"
 SELLER=$NEAR_ACCOUNT_ID
 BUYER=${1:-buyer.$NEAR_ACCOUNT_ID}
 LIMIT=${2:-50}
+# A real payment on Tempo, to an address that is not this room's.
+OTHER_TX=0x1bde22fef2e62d78fc7e8eee17009f787d341c2bae31b2d567977da0cf342a53
 darkroom() { bun cli/darkroom.ts "$@"; }
 refused() { local out; if out=$("$@" 2>&1); then echo "FAIL: should have been refused"; exit 1; else echo "refused: $(echo "$out" | tail -1)"; fi; }
 
@@ -24,20 +27,20 @@ echo "$OUT"
 case "$OUT" in *"no deal"*) echo "== no deal: nothing was ever paid"; exit 0 ;; esac
 sleep 3
 echo "== what NEAR recorded:"
-bun -e "import {view} from './cli/near';const r=await view('$DARKROOM_CONTRACT','get_room',{listing_id:$LISTING,buyer:'$BUYER'});console.log(JSON.stringify({status:r.status,bond:r.cap,protected_value:r.protected_value,terms:r.terms.slice(0,32)+'…',mandate:r.mandate.slice(0,32)+'…'}))"
+bun -e "import {view} from './cli/near';const r=await view('$DARKROOM_CONTRACT','get_room',{listing_id:$LISTING,buyer:'$BUYER'});console.log(JSON.stringify({status:r.status,bond:r.cap,protected_value:r.protected_value,mandate:r.mandate.slice(0,32)+'…'}))"
 
 echo "== attack: fetch without paying"
 refused darkroom buyer fetch --as "$BUYER" --listing "$LISTING"
-echo "== buyer pays through Gloam"
+echo "== attack: fetch with someone else's payment"
+refused darkroom buyer fetch --as "$BUYER" --listing "$LISTING" --tx "$OTHER_TX"
+echo "== buyer pays through Gloam: shields, splits off the price, cashes out to this room's one-time address"
 darkroom buyer pay --as "$BUYER" --listing "$LISTING"
 sleep 3
-echo "== attack: fetch before the seller swept. The buyer could still spend it back."
-refused darkroom buyer fetch --as "$BUYER" --listing "$LISTING"
-echo "== seller sweeps with a key the buyer does not have"
-darkroom seller sweep --as "$SELLER" --listing "$LISTING" --buyer "$BUYER"
-sleep 3
+echo "== the seller did nothing, and the money is already theirs:"
+darkroom seller paid --listing "$LISTING" --buyer "$BUYER"
 echo "== the room saw the payment on Tempo, so the secret is released:"
 darkroom buyer fetch --as "$BUYER" --listing "$LISTING"
+sleep 3
 echo "== the room signed that it saw the payment, so the bond came back: $(bun -e "import {view} from './cli/near';console.log((await view('$DARKROOM_CONTRACT','get_room',{listing_id:$LISTING,buyer:'$BUYER'})).bond_done)")"
 echo "== the TDX quote commits to this wasm, input and output:"
 darkroom verify --call "$(echo "$OUT" | grep -oE 'room run [0-9a-f-]+' | tail -1 | cut -d' ' -f3)"

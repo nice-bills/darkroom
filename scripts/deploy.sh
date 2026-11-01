@@ -9,7 +9,7 @@ set -a; source .env; set +a
 export PATH="$(dirname "$(rustup which --toolchain stable rustc)"):$HOME/.local/bin:$PATH"
 
 ROOT=$NEAR_ACCOUNT_ID
-CONTRACT=room.$ROOT
+CONTRACT=market.$ROOT
 TOKEN=tusdc.$ROOT
 PROJECT=$ROOT/room
 API=https://testnet-api.outlayer.ai
@@ -30,8 +30,7 @@ sleep 3
 ENCLAVE_KEY=$(curl -sS -m 90 -X POST "$API/call/$PROJECT" -H "X-Payment-Key: $PAYMENT_KEY" -H 'Content-Type: application/json' -d '{"input":{"op":"public_key"}}' | python3 -I -c "import sys,json;print(json.load(sys.stdin)['output']['public_key'])")
 echo "enclave key $ENCLAVE_KEY"
 
-if exists "$CONTRACT"; then near account delete-account "$CONTRACT" beneficiary "$ROOT" network-config testnet sign-with-legacy-keychain send >/dev/null 2>&1; sleep 3; fi
-create "$CONTRACT" '2.4 NEAR'
+create "$CONTRACT" '4 NEAR'
 deploy "$CONTRACT" contracts/darkroom/target/near/darkroom.wasm \
   "{\"outlayer\":\"outlayer.testnet\",\"project_id\":\"$PROJECT\",\"token\":\"$TOKEN\",\"enclave_key\":\"$ENCLAVE_KEY\"}"
 near contract call-function as-transaction "$TOKEN" storage_deposit json-args "{\"account_id\":\"$CONTRACT\"}" prepaid-gas '30 Tgas' attached-deposit '0.00125 NEAR' sign-as "$ROOT" network-config testnet sign-with-legacy-keychain send >/dev/null 2>&1

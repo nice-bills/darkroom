@@ -60,13 +60,14 @@ impl Host for Live {
     fn sign(&mut self, m: &[u8]) -> Result<Vec<u8>, Error> { self.fake.sign(m) }
     fn public_key(&mut self) -> Result<Vec<u8>, Error> { self.fake.public_key() }
     fn view(&mut self, m: &str, a: Value) -> Result<Value, Error> { self.fake.view(m, a) }
-    fn vault_read(&mut self, s: [u8; 4], w: [u8; 32]) -> Result<bool, Error> { self.fake.vault_read(s, w) }
+    fn receipts(&mut self, t: &str) -> Result<[Value; 2], Error> { self.fake.receipts(t) }
+    fn caller(&mut self) -> Option<String> { None }
     fn random32(&mut self) -> Result<[u8; 32], Error> { self.fake.random32() }
     fn elapsed_secs(&mut self) -> u64 { 0 }
 }
 
 fn deal<'a>(cap_usdc: u64, secret: &'a str, title: &'a str) -> Deal<'a> {
-    Deal { cap: cap_usdc * USDC, listing_id: 0, buyer: "buyer.testnet", title, protected_value: 50_000, secret, reserve_usdc: RESERVE_USDC, settlement: [0; 64] }
+    Deal { cap: cap_usdc * USDC, listing_id: 0, buyer: "buyer.testnet", title, protected_value: 50_000, secret, reserve_usdc: RESERVE_USDC, settlement: [0; 32] }
 }
 
 /// Hard rules that must hold whatever the agents do. A break fails the benchmark.

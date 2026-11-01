@@ -57,7 +57,7 @@ deploy "$ESCROW" contracts/darkroom/$W/darkroom.wasm "{\"outlayer\":\"$MOCK\",\"
 call "$BUYER" "$TOKEN" mint '{"amount":"100000000"}' '0 NEAR'
 sleep 2
 for a in "$ESCROW"; do call "$BUYER" "$TOKEN" storage_deposit "{\"account_id\":\"$a\"}" '0.00125 NEAR'; done
-for t in deal nodeal timeout tampered unpaid; do call "$( [ $t = unpaid ] && echo "$LATE" || echo "$SELLER")" "$ESCROW" list "{\"profile\":\"p\",\"title\":\"$t\",\"max_rooms\":1,\"commitment\":\"$COMMITMENT\",\"target\":null,\"private_settlement\":false,\"bond\":\"0\"}" '0 NEAR'; done
+for t in deal nodeal timeout tampered unpaid; do call "$( [ $t = unpaid ] && echo "$LATE" || echo "$SELLER")" "$ESCROW" list "{\"profile\":\"p\",\"title\":\"$t\",\"max_rooms\":1,\"commitment\":\"$COMMITMENT\",\"target\":null,\"private_settlement\":false,\"bond\":\"0\"}" '0.01 NEAR'; done
 
 BUYER0=$(balance "$BUYER"); SELLER0=$(balance "$SELLER")
 fund_room 0 20000000; sleep 2

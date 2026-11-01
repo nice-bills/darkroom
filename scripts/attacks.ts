@@ -45,7 +45,7 @@ async function list(target: string | null, isPrivate: boolean) {
   call(root, contract, "list", {
     profile: `attack-${randomBytes(3).toString("hex")}`, title: "Attack fixture", max_rooms: 3, commitment,
     target, private_settlement: isPrivate, bond: isPrivate ? "1000000" : "0",
-  }, "0 NEAR");
+  }, "0.01 NEAR");
   await sleep(1500);
   return id;
 }
@@ -61,7 +61,7 @@ const listing = await list(null, false);
 fund(buyer, { listing_id: listing, buyer_pubkey: pubkey, protected_value: 50_000 }, "5000000");
 await sleep(2500);
 call(buyer, contract, "start_room", { listing_id: listing }, "0 NEAR");
-const forged = { listing_id: listing, buyer, deal: true, price: 5_000_000, ct_ref: "r", ct_hash: "h", terms: "" };
+const forged = { listing_id: listing, buyer, deal: true, price: 5_000_000, ct_ref: "r", ct_hash: "h" };
 
 await refused("forged signature", "Bad signature", () => call(attacker, contract, "settle_signed", { ...forged, sig: "cd".repeat(64) }, "0 NEAR"));
 await refused("real signature moved to another room", "Bad signature", () => call(attacker, contract, "settle_signed", { ...real, listing_id: listing, buyer }, "0 NEAR"));
@@ -86,7 +86,7 @@ console.log(`${kept ? "ok  " : "FAIL"} a non-target buyer gets no room and keeps
 if (!kept) failed++;
 
 const hidden = await list(null, true);
-const sealed = "ef".repeat(64);
+const sealed = "ef".repeat(96);
 await refused("private room paying less than the bond", "no room", async () => {
   fund(buyer, { listing_id: hidden, buyer_pubkey: pubkey, protected_value: 0, sealed_mandate: sealed }, "2");
   await sleep(3000);
@@ -94,7 +94,14 @@ await refused("private room paying less than the bond", "no room", async () => {
 });
 fund(buyer, { listing_id: hidden, buyer_pubkey: pubkey, protected_value: 0, sealed_mandate: sealed }, "1000000");
 await sleep(2500);
-await refused("ticket before a deal", "No deal to pay for", () => call(buyer, contract, "post_ticket", { listing_id: hidden, ticket: "gloam2t.x" }, "0 NEAR"));
+await refused("terms before a deal", "no ct_ref", () => room({ op: "terms", listing_id: hidden, buyer }));
+await refused("a huge profile to fill the contract", "Profile too long", () => call(attacker, contract, "list", {
+  profile: "p".repeat(100), title: "t", max_rooms: 1, commitment, target: null, private_settlement: false, bond: "0",
+}, "0.01 NEAR"));
+await refused("a listing with no storage deposit", "Attach 0.01 NEAR", () => call(attacker, contract, "list", {
+  profile: "p", title: "t", max_rooms: 1, commitment, target: null, private_settlement: false, bond: "0",
+}, "0 NEAR"));
+await refused("the chain door into a private room", "Private listings run through the relayer", () => call(attacker, contract, "open_room", { listing_id: hidden }, "0.1 NEAR"));
 await refused("paid signature with no deal", "No bond to return", () => call(attacker, contract, "confirm_paid", { listing_id: hidden, buyer, sig: "cd".repeat(64) }, "0 NEAR"));
 await refused("taking a bond with no deal", "No bond to take", () => call(attacker, contract, "forfeit", { listing_id: hidden, buyer }, "0 NEAR"));
 

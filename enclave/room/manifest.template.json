@@ -4,7 +4,6 @@
   "operations": ["negotiate", "reveal"],
   "storage_account": "predecessor",
   "signing_keys": [{ "path": "verdict", "type": "ed25519", "caller": "predecessor" }],
-  "encryption_keys": [{ "path": "sealed", "bind": "project", "caller": "predecessor" }],
   "author_secrets": { "profile": "llm" },
   "capabilities": { "network": ["__LLM_HOST__", "__RPC_HOST__", "__RPC_HOST_2__", "__VAULT_RPC_HOST__", "__VAULT_RPC_HOST_2__"] },
   "callers": { "direct": "deny" }

@@ -4,5 +4,6 @@ node_modules/
 submission*.json
 enclave/room/manifest.json
 .darkroom.env
+.room-key
 redteam/results-live.json
 redteam/live-run.log
