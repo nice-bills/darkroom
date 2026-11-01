@@ -6,7 +6,7 @@ import { admit, FLOWS, redact, type Flow, type State } from "./limits";
 
 const DAILY_LIMIT = Number(process.env.RELAY_DAILY_LIMIT ?? 20);
 const RUN_LIMIT_MS = 10 * 60_000;
-const SECRET_NAMES = ["NEAR_PRIVATE_KEY", "LLM_API_KEY", "OUTLAYER_PAYMENT_KEY"];
+const SECRET_NAMES = ["NEAR_PRIVATE_KEY", "OUTLAYER_PAYMENT_KEY", "OUTLAYER_CREDENTIALS_B64"];
 const secrets = SECRET_NAMES.map((name) => process.env[name]).filter((value): value is string => Boolean(value));
 const state: State = { busy: false, day: "", runs: 0, lastEnd: 0 };
 const cors = { "Access-Control-Allow-Origin": process.env.RELAY_ORIGIN ?? "*" };

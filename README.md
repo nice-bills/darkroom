@@ -188,6 +188,8 @@ bun relay/server.ts
 curl -N -X POST localhost:8787/run -d '{"flow":"private"}'
 ```
 
+Or run the same relay from the `Dockerfile`. It needs only testnet keys. The model key stays sealed in OutLayer.
+
 See: each step as it happens. `flow` is `private`, `escrow` or `chain`. One run at a time, a one-minute gap, and `RELAY_DAILY_LIMIT` runs a day (20 by default).
 
 ### Cross-chain quote

@@ -1,0 +1,6 @@
+.git
+.env
+.darkroom.env
+**/target
+**/node_modules
+submission*.json
