@@ -1,0 +1,22 @@
+[package]
+name = "room"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[[bin]]
+name = "room"
+path = "src/main.rs"
+
+[dependencies]
+darkroom-core = { path = "../core" }
+serde_json = "1.0"
+wasi = "0.13"
+outlayer = { version = "0.2", features = ["encryption-keys", "signing-keys"] }
+getrandom = { version = "0.2", features = ["std"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1

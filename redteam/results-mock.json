@@ -1,0 +1,48 @@
+{
+  "mock_channel": {
+    "bits_per_room": 2.95,
+    "broken": [],
+    "ceiling_bits": 3.169925001442312,
+    "rooms": 10000
+  },
+  "mock_malice": {
+    "broken": [],
+    "cases": [
+      {
+        "attack": "over cap",
+        "deal": true,
+        "output": 200
+      },
+      {
+        "attack": "off bucket",
+        "deal": true,
+        "output": 100
+      },
+      {
+        "attack": "secret as reply",
+        "deal": false,
+        "output": 0
+      },
+      {
+        "attack": "secret as price field",
+        "deal": false,
+        "output": 0
+      },
+      {
+        "attack": "negative",
+        "deal": false,
+        "output": 0
+      },
+      {
+        "attack": "float",
+        "deal": false,
+        "output": 0
+      },
+      {
+        "attack": "oversized note",
+        "deal": true,
+        "output": 5
+      }
+    ]
+  }
+}

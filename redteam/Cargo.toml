@@ -1,0 +1,13 @@
+[package]
+name = "redteam"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+darkroom-core = { path = "../enclave/core" }
+serde_json = "1.0"
+ureq = { version = "2", features = ["json"] }
+
+[profile.release]
+opt-level = 2

@@ -1,0 +1,8 @@
+target/
+.env
+node_modules/
+submission*.json
+enclave/room/manifest.json
+.darkroom.env
+redteam/results-live.json
+redteam/live-run.log

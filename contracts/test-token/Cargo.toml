@@ -1,0 +1,23 @@
+[package]
+name = "test-token"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "5"
+near-contract-standards = "5"
+
+[profile.release]
+opt-level = "z"
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"
+overflow-checks = true
+
+[dev-dependencies]
+near-sdk = { version = "5", features = ["unit-testing"] }
