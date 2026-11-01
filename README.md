@@ -67,7 +67,8 @@ The contract also has a yield/resume door (`open_room`), where it calls OutLayer
 | `redteam/` | Leak benchmark |
 | `tools/verify-quote` | Checks a TDX quote against Intel's root with `dcap-qvl` |
 | `intents/` | Dry-run quote |
-| `scripts/` | `e2e.sh`, `e2e-private.sh`, `deploy.sh`, `update-room.sh`, `settlement-check.sh` |
+| `relay/` | One public endpoint that runs a real room and streams each step, with a daily cap |
+| `scripts/` | `attacks.ts`, `e2e.sh`, `e2e-private.sh`, `deploy.sh`, `update-room.sh`, `settlement-check.sh` |
 
 ## Status
 
@@ -79,14 +80,14 @@ The contract also has a yield/resume door (`open_room`), where it calls OutLayer
 | Walking away from a price costs money | A private room holds a public bond. The room signs for its return only after it sees the swept payment, otherwise it goes to the seller after the pay window |
 | A private payment cannot be faked | Run on a real ticket from a spent Gloam payment, with the room's checks in tests: paid to someone else, underpaid, spent back by the buyer, never swept, swept for another room, wrong chain or token |
 | The planned model is really in a TEE | `darkroom verify-model --model z-ai/glm-5.3-flash`: gateway and model quotes verify against Intel, bound to a fresh nonce, and NVIDIA's service accepts the GPU evidence. The check refuses `z-ai/glm-5.3`, a third-party route. The room does not run this model yet |
-| The relayer cannot cheat | 7 attacks refused live, more in tests: forged signature, replay on another buyer, replay on a settled room, changed price, reveal without a deal, re-running a room, lying about the cap |
+| The relayer cannot cheat | `scripts/attacks.ts`: 13 attacks refused on the final deployment, with real transactions and worker calls. They include a forged signature, a real signature moved or edited, replay on a settled room, reveal without a deal, a second run, lying about the cap, and forged bond claims |
 | A finding reaches only its owner | A listing can name its one allowed buyer, and the real claim stays in the encrypted row. The contract refused a non-target buyer and returned the funds |
 | A silent relayer cannot trap funds | `refund_stale` returned four stuck budgets on testnet |
 | Hostile data does not buy itself | [docs/redteam.md](docs/redteam.md) |
 | The run really happened in a TEE | `darkroom verify --call`: the quote commits to the wasm, input and output, Intel's signature chain verifies, TCB is `UpToDate`, and the worker build is on OutLayer's on-chain approved list |
 | One lying RPC cannot fake a deal | The room reads two independent RPCs and refuses if they differ |
 | Only allowed callers can read a secret | The real worker refused a call from outside the production door. Nothing executed |
-| Anyone can rebuild the same wasm | `enclave/room/build.sh`: same sha256 from two directories |
+| Anyone can rebuild the same wasm | `enclave/room/build.sh` from a clean clone gives the deployed sha256 |
 | The demo secret is real | `decoy/attacker` drained 0.5 NEAR on testnet with no deposit |
 | Yield/resume settlement | `DOOR=chain scripts/e2e.sh`: the contract starts the room, the callback settles at 10 USDC with no relayer, and the exact secret comes back through a second contract call. Works since `max_memory_mb` was added. A request that omits a limit is ignored by workers and times out (OutLayer issue 31) |
 | Tempo reads have two sources | The room reads Tempo's RPC and dRPC and refuses if they differ. A lying source is refused in the harness |
@@ -168,6 +169,27 @@ Same setup, plus Node 24. Tempo's testnet faucet funds the payments.
 
 See: a `Deal` with price `0`, a bond and no limit on NEAR, two `refused:` lines, shield and pay and sweep on Tempo, the exploit text, and the bond back. Or `no deal: nothing was ever paid`. Run it again for a new listing.
 
+### Live attacks
+
+After a deal through the relayer, with the `settle_signed` tx it printed:
+
+```bash
+set -a; source .env; source .darkroom.env; set +a
+bun scripts/attacks.ts <settle_signed tx>
+```
+
+See: `ok` per attack, then `ALL ATTACKS REFUSED`. No model runs.
+
+### Relay
+
+```bash
+set -a; source .env; source .darkroom.env; set +a
+bun relay/server.ts
+curl -N -X POST localhost:8787/run -d '{"flow":"private"}'
+```
+
+See: each step as it happens. `flow` is `private`, `escrow` or `chain`. One run at a time, a one-minute gap, and `RELAY_DAILY_LIMIT` runs a day (20 by default).
+
 ### Cross-chain quote
 
 ```bash
@@ -218,7 +240,7 @@ See: the cost of funding 20 USDC from Arbitrum, labelled as a dry run.
 - **Private settlement crosses chains with no bridge.** The room needs two Tempo sources to agree, so if dRPC or Tempo's RPC is down, the reveal waits and can be retried. A seller who never sweeps is unpaid, and the buyer gets no secret, then spends the note back.
 - **Gloam is beta and on Tempo uses development proving keys.** Its external audit is still planned. This is not a partnership.
 - **NEAR Intents is not executed.** Quote only, no testnet exists.
-- **No storage deposits** for listings and rooms, and no fee model. Testnet only.
+- **No storage deposits** for listings and rooms, and no fee model. The contract account pays, so a public demo must keep it topped up. Testnet only.
 
 ## Related work
 
