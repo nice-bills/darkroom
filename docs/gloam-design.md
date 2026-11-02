@@ -22,7 +22,7 @@ Keeping a private note safe needs the room to make the sweep proof itself, which
 1. The seller's row holds a payee seed. Each room's address derives from it, so no two rooms share one.
 2. On a deal the room signs a verdict with price 0. The chain records a deal and learns no price.
 3. After the chain records the deal, the `terms` run seals the price and the room's address to the buyer at a fixed size. A verdict seen early by a relayer shows no price.
-4. The buyer shields a fixed 200 USDC, splits off the exact price as a private note, and cashes it out to the address through Gloam's relay. The cash out is final on arrival.
+4. The buyer holds a private balance, shielded ahead of any deal in fixed 200 USDC steps. They split off the exact price as a private note, wait a random time, and cash it out to the address through Gloam's relay. The cash out is final on arrival.
 5. The buyer runs the reveal through a relayer or the contract, with the transaction hash sealed to the room, so NEAR shows no link. The room reads the receipt from two RPCs, confirms the address received the price in the right token, and seals the secret to the buyer. The bond returns through a signed receipt or the contract callback.
 
 ## Failure cases

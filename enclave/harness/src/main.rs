@@ -198,7 +198,6 @@ impl Room {
             .env("DARKROOM_RESERVE_USDC", "2")
             .env("DARKROOM_TITLE", "Critical drain in the decoy vault")
             .env("DARKROOM_PAYEE_SEED", "03".repeat(32))
-            .env("DARKROOM_ROOM_KEY", "04".repeat(32))
             .env("DARKROOM_SALT", std::env::var("HARNESS_SALT").unwrap_or(SALT.to_string()))
             .env("LLM_API_KEY", api_key)
             .build();

@@ -34,8 +34,8 @@ echo "== attack: fetch without paying"
 refused darkroom buyer fetch --as "$BUYER" --listing "$LISTING"
 echo "== attack: fetch with someone else's payment"
 refused darkroom buyer fetch --as "$BUYER" --listing "$LISTING" --tx "$OTHER_TX"
-echo "== buyer pays through Gloam: shields, splits off the price, cashes out to this room's one-time address"
-darkroom buyer pay --as "$BUYER" --listing "$LISTING" ${DOOR:+--door "$DOOR"}
+echo "== buyer pays from a private balance: splits off the price, cashes out to this room's one-time address"
+darkroom buyer pay --as "$BUYER" --listing "$LISTING" --delay 0 ${DOOR:+--door "$DOOR"}
 sleep 3
 echo "== the seller did nothing, and the money is already theirs:"
 darkroom seller paid --listing "$LISTING" --buyer "$BUYER"

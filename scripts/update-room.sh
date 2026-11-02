@@ -25,8 +25,12 @@ for attempt in 1 2 3 4 5 6 7 8; do [ "$(curl -sSL -m 60 "$URL" | sha256sum | cut
 sleep 5
 retry outlayer deploy room "$URL" --hash "$HASH"
 sleep 5
-# Seals every deal, so it must survive new builds. Stays in .room-key, gitignored.
-[ -f .room-key ] || (umask 077; openssl rand -hex 32 > .room-key)
-retry outlayer secrets set "{\"LLM_API_KEY\":\"$LLM_API_KEY\",\"DARKROOM_ROOM_KEY\":\"$(cat .room-key)\"}" --profile llm --project "$PROJECT" --access allow-all --build "$HASH" --via "$DARKROOM_CONTRACT,$NEAR_ACCOUNT_ID"
+retry outlayer secrets set "{\"LLM_API_KEY\":\"$LLM_API_KEY\"}" --profile llm --project "$PROJECT" --access allow-all --build "$HASH" --via "$DARKROOM_CONTRACT,$NEAR_ACCOUNT_ID"
 if [ -f .darkroom.env ]; then sed -i "s/^DARKROOM_WASM_HASH=.*/DARKROOM_WASM_HASH=$HASH/" .darkroom.env; fi
+# Older versions stay callable until removed.
+tmp=$(mktemp -d)
+printf 'network = "testnet"\n\n[project]\nname = "room"\nowner = "%s"\n' "$NEAR_ACCOUNT_ID" > "$tmp/outlayer.toml"
+versions=$(bun -e "import {view} from './cli/near';for (const v of await view('outlayer.testnet','list_versions',{project_id:'$PROJECT'})) if (!v.is_active) console.log(v.wasm_hash)")
+for version in $versions; do (cd "$tmp" && retry outlayer versions remove "$version"); done
+rm -rf "$tmp"
 echo "$HASH"

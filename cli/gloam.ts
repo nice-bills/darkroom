@@ -1,7 +1,8 @@
 // Private settlement through Gloam on Tempo testnet. Run with Node: snarkjs crashes under Bun.
-//   pay <address> <price> <ct_ref> <account>  shields, cashes out, prints the payment's hash
+//   pay <address> <price> <ct_ref> <account> <max delay minutes>  cashes out, prints the hash
+//   shield <account>                          adds to a private balance, ahead of any deal
 //   balance <seed> <ct_ref>                   what a room's one-time address holds
-//   reclaim <ct_ref> <account> <address>      cashes out the rest of the shielded amount
+//   reclaim <account> <address>               cashes out the whole private balance
 import * as G from "@gloamtrade/sdk";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -92,48 +93,66 @@ const spent = (nullifier) => client.readContract({ address: net.pool, abi: G.POO
 const bigints = (_key, value) => (typeof value === "bigint" ? { $big: value.toString() } : value);
 const revive = (_key, value) => (value?.$big ? BigInt(value.$big) : value);
 
+const notesPath = (account) => join(DIR, `notes-${account}.json`);
+const readNotes = (account) => (existsSync(notesPath(account)) ? JSON.parse(readFileSync(notesPath(account), "utf8"), revive) : []);
+const writeNotes = (account, notes) => writeFileSync(notesPath(account), JSON.stringify(notes, bigints), { mode: 0o600 });
+
+/// Adds to a private balance, written down before the money moves. Doing this ahead of a deal
+/// means a public shield says nothing about when a deal happened.
+async function shield(account) {
+  const payer = await funded(`${account}-shield-${Date.now()}`);
+  const built = await G.buildShieldBoundIntent({
+    chainId: net.chainId, poolAddress: net.pool, asset, amountWei: SHIELD_WEI, prover: await prover("shield"),
+  });
+  const note = { secret: built.note.secret, commitment: built.note.commitment, amountWei: SHIELD_WEI.toString() };
+  writeNotes(account, [...readNotes(account), note]);
+  await wait(await payer.writeContract({ address: asset, abi: erc20, functionName: "approve", args: [net.pool, SHIELD_WEI] }));
+  const shielded = await wait(await payer.writeContract({
+    address: built.exec.poolAddress,
+    abi: parseAbi(["function shieldBound(address,uint256,bytes32,bytes)"]),
+    functionName: built.exec.fn,
+    args: built.exec.args,
+  }));
+  if (shielded.status !== "success") throw new Error("shield reverted");
+  log(`shield tx ${shielded.transactionHash}`);
+  return note;
+}
+
 /// Every step is written down before its money moves, and each is checked against the chain on
-/// a rerun, so a failure at any point resumes and never makes a second note over the first.
-async function pay(payee, priceText, ctRef, account) {
+/// a rerun, so a failure at any point resumes and never loses a note.
+async function pay(payee, priceText, ctRef, account, maxDelayMinutes) {
   const price = BigInt(priceText);
   const file = join(DIR, `pay-${ctRef}.json`);
   const state = existsSync(file) ? JSON.parse(readFileSync(file, "utf8"), revive) : {};
   const save = () => writeFileSync(file, JSON.stringify(state, bigints), { mode: 0o600 });
   if (state.tx) return console.log(state.tx);
-  const payer = await funded(`${account}-${ctRef}`);
-
-  if (!state.shield) {
-    const shield = await G.buildShieldBoundIntent({
-      chainId: net.chainId, poolAddress: net.pool, asset, amountWei: SHIELD_WEI, prover: await prover("shield"),
-    });
-    state.shield = { note: shield.note, exec: shield.exec };
-    save();
-  }
-  if (!(await seen(state.shield.note.commitment))) {
-    await wait(await payer.writeContract({ address: asset, abi: erc20, functionName: "approve", args: [net.pool, SHIELD_WEI] }));
-    const shielded = await wait(await payer.writeContract({
-      address: state.shield.exec.poolAddress,
-      abi: parseAbi(["function shieldBound(address,uint256,bytes32,bytes)"]),
-      functionName: state.shield.exec.fn,
-      args: state.shield.exec.args,
-    }));
-    if (shielded.status !== "success") throw new Error("shield reverted");
-    log(`shield tx ${shielded.transactionHash}`);
-  }
+  const payer = wallet(`${account}-${ctRef}`);
 
   // A cash out spends a whole note, so first split off exactly the price.
   if (!state.split) {
+    const usable = async (note) => BigInt(note.amountWei) >= price && (await seen(note.commitment));
+    const notes = readNotes(account);
+    let input;
+    for (const note of notes) if (!input && (await usable(note))) input = note;
+    input ??= await shield(account);
+    const amountInWei = BigInt(input.amountWei);
     const split = await G.buildPrivateSendIntent({
-      secretHex: state.shield.note.secret, amountInWei: SHIELD_WEI, amountPayWei: price, asset,
-      path: await pathFor(state.shield.note.commitment), prove: await prover("transfer"),
+      secretHex: input.secret, amountInWei, amountPayWei: price, asset,
+      path: await pathFor(input.commitment), prove: await prover("transfer"),
       poolAddress: net.pool, chainId: net.chainId,
     });
-    state.split = { note: split.paymentNote, change: split.changeNote, args: G.transferCallArgs(split) };
+    state.split = { note: split.paymentNote, args: G.transferCallArgs(split) };
     save();
+    const change = { secret: split.changeNote.secret, commitment: split.changeNote.commitment, amountWei: (amountInWei - price).toString() };
+    writeNotes(account, [...readNotes(account).filter((note) => note.commitment !== input.commitment), change]);
   }
   if (!(await seen(state.split.note.commitment))) {
     log(`split tx ${await submit(payer, { chainId: net.chainId, exec: { fn: "transfer", args: state.split.args } }, G.POOL_TRANSFER_ABI)}`);
   }
+
+  const delay = Math.floor(Math.random() * Number(maxDelayMinutes) * 60_000);
+  if (delay) log(`waiting ${Math.round(delay / 60_000)} minutes, so the payment does not date the deal`);
+  await new Promise((resolve) => setTimeout(resolve, delay));
 
   const nullifier = G.fieldToBytes32(await G.noteNullifierPoseidon(G.hexToField(state.split.note.secret), G.hexToField(state.split.note.commitment)));
   if (await spent(nullifier)) throw new Error(`The payment landed but its hash was lost. Find it on Tempo for ${payee}, then pass buyer fetch --tx`);
@@ -147,16 +166,21 @@ async function pay(payee, priceText, ctRef, account) {
   console.log(state.tx);
 }
 
-/// Takes what is left of the shielded amount back out, to any address.
-async function reclaim(ctRef, account, to) {
-  const { split } = JSON.parse(readFileSync(join(DIR, `pay-${ctRef}.json`), "utf8"), revive);
-  const amountWei = BigInt(split.change.amountWei);
-  const intent = await G.buildUnshieldIntent({
-    secretHex: split.change.secret, amountWei, asset, to,
-    path: await pathFor(split.change.commitment), prove: await prover("unshield"),
-    poolAddress: net.pool, chainId: net.chainId,
-  });
-  console.log(await submit(wallet(`${account}-${ctRef}`), intent, UNSHIELD_ABI));
+/// Takes the whole private balance back out, to any address.
+async function reclaim(account, to) {
+  let notes = readNotes(account);
+  for (const note of notes) {
+    const hash = G.fieldToBytes32(await G.noteNullifierPoseidon(G.hexToField(note.secret), G.hexToField(note.commitment)));
+    if (!(await seen(note.commitment)) || (await spent(hash)) || BigInt(note.amountWei) === 0n) continue;
+    const intent = await G.buildUnshieldIntent({
+      secretHex: note.secret, amountWei: BigInt(note.amountWei), asset, to,
+      path: await pathFor(note.commitment), prove: await prover("unshield"),
+      poolAddress: net.pool, chainId: net.chainId,
+    });
+    console.log(await submit(wallet(account), intent, UNSHIELD_ABI));
+    notes = notes.filter((other) => other !== note);
+    writeNotes(account, notes);
+  }
 }
 
 /// What a room's one-time address holds. Only the holder of the seed can spend it.
@@ -168,5 +192,5 @@ async function balance(seedHex, ctRef) {
 
 mkdirSync(DIR, { recursive: true, mode: 0o700 });
 const [command, ...args] = process.argv.slice(2);
-await ({ pay, balance, reclaim })[command](...args);
+await ({ pay, balance, reclaim, shield: (account) => shield(account).then(() => console.log("shielded")) })[command](...args);
 process.exit(0);

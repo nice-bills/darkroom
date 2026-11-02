@@ -18,11 +18,21 @@ const USDC = 1_000_000;
 // Mirrors the contract. Paying takes minutes, so it must not start at the edge of the window.
 const PAY_WINDOW_BLOCKS = 6000;
 const PAY_MARGIN_BLOCKS = 1000;
+/// The most `buyer pay` waits at random before cashing out, so a payment does not date the deal.
+const DEFAULT_DELAY_MINUTES = 30;
 const KEY_DIR = join(homedir(), ".darkroom");
 const keyPath = (listing: number, account: string) => join(KEY_DIR, `${listing}-${account}.json`);
 const paymentPath = (ctRef: string) => join(KEY_DIR, `paid-${ctRef}.tx`);
 const sellerSeedPath = (listing: number) => join(KEY_DIR, `seller-${listing}.seed`);
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/// From the chain, so nobody has to keep a copy current.
+async function activeBuild(): Promise<string> {
+  const versions: any[] = await view("outlayer.testnet", "list_versions", { project_id: env("DARKROOM_PROJECT") });
+  const active = versions.find((version) => version.is_active);
+  if (!active) throw new Error("The project has no active version");
+  return active.wasm_hash;
+}
 
 async function sellerList(o: Record<string, any>) {
   const contract = env("DARKROOM_CONTRACT");
@@ -49,7 +59,7 @@ async function sellerList(o: Record<string, any>) {
   const stored = spawnSync(
     "outlayer",
     ["secrets", "set", JSON.stringify(row), "--profile", profile, "--project", env("DARKROOM_PROJECT"),
-     "--access", "allow-all", "--build", env("DARKROOM_WASM_HASH"), "--via", `${contract},${env("DARKROOM_RELAYER")}`],
+     "--access", "allow-all", "--build", await activeBuild(), "--via", `${contract},${env("DARKROOM_RELAYER")}`],
     { encoding: "utf8" },
   );
   if (stored.status !== 0) throw new Error(`outlayer secrets set failed:\n${stored.stderr.slice(-400)}`);
@@ -226,13 +236,17 @@ async function buyerPay(o: Record<string, any>) {
   const { secret } = JSON.parse(readFileSync(keyPath(listing, o.as), "utf8"));
   const terms = JSON.parse(new TextDecoder().decode(openDelivery(secret, await readPublic(`terms:${ctRef}`))));
   console.log(`sealed terms: ${Number(terms.price) / USDC} USDC`);
-  const tx = gloam("pay", terms.pay_to, String(terms.price), ctRef, o.as).trim();
+  const tx = gloam("pay", terms.pay_to, String(terms.price), ctRef, o.as, String(o.delay ?? DEFAULT_DELAY_MINUTES)).trim();
   writeFileSync(paymentPath(ctRef), tx, { mode: 0o600 });
   console.log("paid. The payment is final. Run: buyer fetch");
 }
 
+function buyerShield(o: Record<string, any>) {
+  console.log(gloam("shield", o.as).trim());
+}
+
 function buyerReclaim(o: Record<string, any>) {
-  console.log(gloam("reclaim", `${o.listing}-${o.as}`, o.as, o.to));
+  console.log(gloam("reclaim", o.as, o.to).trim());
 }
 
 async function sellerPaid(o: Record<string, any>) {
@@ -334,9 +348,9 @@ async function verifyCall(o: Record<string, any>) {
   ]) hash.update(part);
   const computed = hash.digest("hex");
   const inQuote = quote.subarray(568, 600).toString("hex");
-  const expected = process.env.DARKROOM_WASM_HASH;
-  if (expected && a.wasm_hash !== expected) {
-    console.log(`FAIL the run used ${a.wasm_hash}, not the published ${expected}`);
+  const expected = await activeBuild();
+  if (a.wasm_hash !== expected) {
+    console.log(`FAIL the run used ${a.wasm_hash}, not the active ${expected}`);
     process.exit(1);
   }
   console.log(`quote: version ${quote.readUInt16LE(0)}, tee type 0x${quote.readUInt32LE(4).toString(16)}`);
@@ -410,7 +424,7 @@ async function main() {
     args: process.argv.slice(2),
     allowPositionals: true,
     options: Object.fromEntries(
-      ["as", "buyer", "bond", "tx", "to", "model", "url", "title", "private-title", "target", "secret-file", "reserve", "max-rooms", "listing", "budget", "protects", "door", "tx", "wasm", "signer", "call"]
+      ["as", "buyer", "bond", "tx", "to", "delay", "model", "url", "title", "private-title", "target", "secret-file", "reserve", "max-rooms", "listing", "budget", "protects", "door", "tx", "wasm", "signer", "call"]
         .map((name) => [name, { type: "string" as const }])
         .concat([["private", { type: "boolean" as const }]] as any),
     ),
@@ -420,6 +434,7 @@ async function main() {
   if (group === "seller" && verb === "paid") return sellerPaid(values);
   if (group === "buyer" && verb === "pay") return buyerPay(values);
   if (group === "buyer" && verb === "reclaim") return buyerReclaim(values);
+  if (group === "buyer" && verb === "shield") return buyerShield(values);
   if (group === "buyer" && verb === "open") return buyerOpen(values);
   if (group === "buyer" && verb === "fetch") return buyerFetch(values);
   if (group === "buyer" && verb === "cancel") return buyerCancel(values);
@@ -433,9 +448,10 @@ async function main() {
       [--private-title <claim only agents see>] [--target <only allowed buyer>] [--max-rooms <n>]
       [--private] [--bond <usdc, below the reserve>]   pay through Gloam: NEAR sees no price, payee or limit
   darkroom seller paid --listing <id> --buyer <account>
-  darkroom buyer reclaim --as <account> --listing <id> --to <Tempo address>
+  darkroom buyer shield --as <account>     adds 200 USDC to a private balance ahead of any deal
+  darkroom buyer reclaim --as <account> --to <Tempo address>
   darkroom seller forfeit --as <account> --listing <id> --buyer <account>
-  darkroom buyer pay --as <account> --listing <id> [--door chain]
+  darkroom buyer pay --as <account> --listing <id> [--door chain] [--delay <max minutes>]
   darkroom buyer open --as <account> --listing <id> --budget <usdc> [--protects <usdc at risk>] [--door chain]
   darkroom buyer fetch --as <account> --listing <id> [--door chain] [--tx <Tempo payment>]
   darkroom buyer cancel --as <account> --listing <id>

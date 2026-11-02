@@ -43,7 +43,7 @@ The contract also has a yield/resume door (`open_room`), where it calls OutLayer
 
 ## NEAR technology used
 
-- **OutLayer TEE (Intel TDX)**: runs the room. Secret rows locked by wasm hash and caller, an ed25519 signing key that exists only inside runs, a room key in the author row, project-wide worker storage, manifest `callers` and `capabilities.network`, public storage, TDX attestation.
+- **OutLayer TEE (Intel TDX)**: runs the room. Secret rows locked by wasm hash and caller, an ed25519 signing key that exists only inside runs, a room key created inside the first run, project-wide worker storage, manifest `callers` and `capabilities.network`, public storage, TDX attestation.
 - **NEAR contract with `ed25519_verify`**: settles from a signature only the enclave can make, with no operator step. See Known limitations for who holds keys on testnet.
 - **OutLayer yield/resume**: `request_execution` from the contract, with the callback settling. Works end to end on testnet with no relayer, for public and private rooms.
 - **NEP-141 escrow**: `ft_on_transfer` funds a room, `ft_transfer` settles it.
@@ -87,7 +87,7 @@ The contract also has a yield/resume door (`open_room`), where it calls OutLayer
 | The run really happened in a TEE | `darkroom verify --call`: the quote commits to the wasm, input and output, Intel's signature chain verifies, TCB is `UpToDate`, and the worker build is on OutLayer's on-chain approved list |
 | One lying RPC cannot fake a deal | The room reads two independent RPCs and refuses if they differ |
 | Direct calls are refused | The manifest denies `direct`. HTTPS callers can start the wasm, and only this build started by the contract or the relayer can read a secret row. That rule is enforced by OutLayer |
-| Anyone can rebuild the same wasm | `enclave/room/build.sh` from a clean clone gives the deployed sha256 `62c93637…76188`, with `DARKROOM_CONTRACT=deals.darkroom-nb.testnet`, `DARKROOM_LLM_URL=https://api.anthropic.com/v1/messages`, `DARKROOM_LLM_MODEL=claude-haiku-5-5` and the two RPC URLs in `.env.example`. The contract uses a non-reproducible build, so its deployed code cannot be checked this way |
+| Anyone can rebuild the same wasm | `enclave/room/build.sh` from a clean clone gives the deployed sha256 `b5395e34…d6318`, with `DARKROOM_CONTRACT=deals.darkroom-nb.testnet`, `DARKROOM_LLM_URL=https://api.anthropic.com/v1/messages`, `DARKROOM_LLM_MODEL=claude-haiku-5-5` and the two RPC URLs in `.env.example`. The contract uses a non-reproducible build, so its deployed code cannot be checked this way |
 | The demo secret is real | `decoy/attacker` drained 0.5 NEAR on testnet with no deposit |
 | No relayer needed | `DOOR=chain scripts/e2e.sh` and `DOOR=chain scripts/e2e-private.sh`: the contract starts the room, the callback settles, and terms and reveal run from the contract. A private deal completed this way, with the bond returned by the callback. A request that omits a limit is ignored by workers and times out (OutLayer issue 31) |
 | Tempo reads have two sources | The room reads Tempo's RPC and dRPC and refuses if they differ. A lying source is refused in the harness |
@@ -160,14 +160,14 @@ Single steps are `bun cli/darkroom.ts` with no arguments.
 
 ### Private settlement on testnet
 
-Same setup, plus Node 24. Tempo's testnet faucet funds the payments.
+Same setup, plus Node 24. Tempo's testnet faucet funds the payments. Run `bun cli/darkroom.ts buyer shield --as <buyer>` once ahead of time, or the first payment shields for itself.
 
 ```bash
 (cd cli && bun install)
 ./scripts/e2e-private.sh
 ```
 
-See: a `Deal` with price `0`, a bond and no limit on NEAR, two `refused:` lines, the one-time address holding the price, the exploit text, and the bond back. Or `no deal: any escrow is refunded`. Run it again for a new listing. Paying takes about 4 minutes locally, and more on a small server. `buyer pay` resumes if it stops. `DOOR=chain` runs it with no relayer, at 0.1 NEAR per run.
+See: a `Deal` with price `0`, a bond and no limit on NEAR, two `refused:` lines, the one-time address holding the price, the exploit text, and the bond back. Or `no deal: any escrow is refunded`. Run it again for a new listing. A full run takes about 4 minutes locally from a shielded balance, and more on a small server. `buyer pay` resumes if it stops. `DOOR=chain` runs it with no relayer, at 0.1 NEAR per run.
 
 ### Live attacks
 
@@ -224,15 +224,15 @@ See: the cost of funding 20 USDC from Arbitrum, labelled as a dry run.
 20. **One door per room.** The contract records `relay` or `chain`, and the room refuses the other, so a room negotiates once.
 21. **Either door can reveal.** Deals are sealed under a room key and kept in project-wide storage, and a buyer can run terms and reveal from the contract, so a silent relayer strands nobody. The payment hash goes in sealed to the room.
 22. **A paid buyer beats a forfeit.** A claim on the bond opens a grace period, and showing payment during it wins. `buyer pay` refuses to start near the end of the window.
-23. **A payment resumes.** Each step is written down before money moves and checked against the chain on a rerun. `buyer reclaim` cashes out what was left of the shielded amount.
+23. **A payment resumes.** Each step is written down before money moves and checked against the chain on a rerun. `buyer reclaim` cashes out the private balance.
 
 ## Known limitations
 
 - **Covert channel.** A price and deal bit can carry at most log2(9) = 3.17 bits per room. `redteam` measures that bound on colluding agents. Timing is not counted: the run time is visible and depends on rounds and retries. Total leak per listing is at most `max_rooms` x 3.17 bits plus timing. It is bounded, not zero. A short secret can be leaked this way if an agent cooperates.
 - **The model provider sees the secret** unless it runs in an attested TEE. Any other endpoint is a dev stand-in and voids the confidentiality claim. The demo model, Claude Haiku 5.5 through the Anthropic API, is such a stand-in: Anthropic sees the secret. Use only decoy secrets with it. `z-ai/glm-5.3-flash` on NEAR AI Cloud passes `verify-model` but needs an API key we do not have yet, so no run has used it. The check covers the endpoint, not each reply. Agents in the room also read the secret by design.
 - **Trust moves, it does not vanish.** You trust Intel TDX, OutLayer's worker registry and keystore, and that the two RPC endpoints the room reads are not lying together.
-- **The project owner is trusted.** The signing key is bound to the project, and whoever publishes a version decides what it signs. The room key lives in the author row, so the owner holds it and a new version could read sealed deals, including unpaid ones. For real use, the keys must be generated and locked so no person holds them. On testnet one throwaway key holds the project and the contract, and the hosted relay holds it too.
-- **Older versions stay published.** Testnet has several inactive project versions. Secret rows are locked to one build, so they cannot read rows. Remove them before real use.
+- **The project owner is trusted.** No person holds the room key: it is created inside the first run and kept in storage only wasm can read. But whoever owns the project can publish a new version, and a new version could read that key and sign anything. The project owner key stays live until the model is final, because swapping the model needs a new version. Until then it is the one key to trust, and the hosted relay holds it. Locking it is the last step before real use.
+- **Only the active version is published.** `scripts/update-room.sh` removes the others.
 - **The relayer sees which rooms run and when,** and can delay or drop a run. A buyer can then use the contract door, at 0.1 NEAR per run. It cannot see the secret or the negotiation. A buyer who is also the relayer can drop a verdict and learn the deal bit for free.
 - **Agent outcomes vary.** A real finding can still end in no deal, and models occasionally decline to price an exploit, though retries and the buyer prompt reduce that. A room shows no reason, by design. The bench prints every reply, so diagnose there.
 - **A deal can leave the seller paid and the buyer waiting** if every reveal run fails. `reveal` retries, and the sealed copy persists, but delivery depends on OutLayer being up.
@@ -241,7 +241,7 @@ See: the cost of funding 20 USDC from Arbitrum, labelled as a dry run.
 - **The wasm is on Walrus testnet,** because `test.fastfs.io` is still down. It is paid for 50 epochs, about 50 days, which outlasts judging. Testnet storage is not a promise for real use, so republish before then. Each new build needs a new upload.
 - **Escrow settlement is public.** Who paid whom, and the price bucket, are on chain. A relayer also sees a public verdict before it settles, and could let the room go stale to get a free look at the price.
 - **Private settlement has a bond, not escrow.** A buyer can learn the price and not pay. That leaks the deal bit and bucket for that room and costs the bond, which must stay below the seller's reserve. An outage that outlasts the window and grace period can cost an honest buyer the bond.
-- **What private hides, and what it does not.** NEAR shows no price, payee or limit. It does show who listed, who bought, the target and that a deal happened, and the target names the vulnerable protocol. On Tempo the cash out shows the amount and the one-time address, and a watcher who matches timing could guess the price. The shield comes from the buyer's own address, for a fixed 200 USDC. Payments use Gloam's relay and fall back to a direct send, which shows that address. On mainnet the pools keep a 0.25% cash-out fee, which `buyer pay` does not add yet.
+- **What private hides, and what it does not.** NEAR shows no price, payee or limit. It does show who listed, who bought, the target and that a deal happened, and the target names the vulnerable protocol. On Tempo a cash out shows its amount and a one-time address. That cannot be hidden today: hiding it needs the room to make a private proof itself, which does not fit in a run. What hides the link is that a shield happens ahead of any deal (`buyer shield`), the payment goes through Gloam's relay, and `buyer pay` waits a random time, up to 30 minutes by default. A watcher can still guess by matching amounts and times. If the relay refuses, the fallback sends directly and shows that address. On mainnet the pools keep a 0.25% cash-out fee, which `buyer pay` does not add yet.
 - **Only `listing_count` orders listings.** Two sellers listing at once can read the same id in the CLI. The chain is correct, and the printed id may not be.
 - **Private settlement crosses chains with no bridge.** The room needs two Tempo sources to agree, so if dRPC or Tempo's RPC is down, the reveal waits and can be retried.
 - **Gloam is beta and on Tempo uses development proving keys.** Its external audit is still planned. This is not a partnership.

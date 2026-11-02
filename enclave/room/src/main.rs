@@ -1,5 +1,5 @@
 use darkroom_core::gloam::Vault;
-use darkroom_core::{agreed, from_hex, llm_auth, llm_body, llm_text, room_mac, room_open, room_seal, rpc_request, rpc_value, run, Error, Host};
+use darkroom_core::{agreed, llm_auth, llm_body, llm_text, room_mac, room_open, room_seal, rpc_request, rpc_value, run, Error, Host};
 use outlayer::{signing_keys, storage};
 use std::env;
 use std::io::{self, Read, Write};
@@ -25,14 +25,22 @@ const VAULT_RPC: &str = env!("DARKROOM_VAULT_RPC");
 const VAULT_RPC_2: &str = env!("DARKROOM_VAULT_RPC_2");
 const VAULT: Vault = Vault { asset: env!("DARKROOM_VAULT_ASSET") };
 const VERDICT_KEY: &str = "verdict";
+const ROOM_KEY: &str = "room-key";
 
 struct Enclave {
     started: Instant,
 }
 
-/// From the author row, which only this build can read, started by the contract or the relayer.
+/// Born inside the first run, in storage only wasm can read, so no person ever holds it. The
+/// deploy script makes that first run, so two runs never race to create it.
 fn room_key() -> Result<[u8; 32], Error> {
-    from_hex(&env::var("DARKROOM_ROOM_KEY")?)?.try_into().map_err(|_| "bad room key".into())
+    if let Some(key) = storage::get_worker(ROOM_KEY)? {
+        return key.try_into().map_err(|_| "bad room key".into());
+    }
+    let mut key = [0u8; 32];
+    getrandom::getrandom(&mut key)?;
+    storage::set_worker(ROOM_KEY, &key)?;
+    Ok(key)
 }
 
 impl Host for Enclave {
