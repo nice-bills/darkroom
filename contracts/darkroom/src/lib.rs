@@ -1,4 +1,4 @@
-//! Escrow for sealed negotiations: the buyer funds a room in NEP-141, OutLayer runs it,
+//! Sealed negotiations: a buyer funds a room in NEP-141 or posts a bond, OutLayer runs it,
 //! and the callback settles. Anything but a valid verdict refunds the buyer.
 //! shortcut: no storage deposits for listings and rooms, add before mainnet.
 use near_sdk::json_types::U128;
@@ -23,6 +23,10 @@ const COMMITMENT_HEX_LEN: usize = 64;
 const MANDATE_HEX_LEN: usize = 2 * (32 + 48 + 16);
 /// About an hour for the buyer to pay. Nothing the seller does can use it up.
 const PAY_WINDOW_BLOCKS: u64 = 6000;
+/// After a seller claims a bond, a buyer who already paid still has this long to show it.
+const FORFEIT_GRACE_BLOCKS: u64 = 1800;
+/// Ephemeral key, a 66-character hash, tag.
+const SEALED_TX_HEX_LEN: usize = 2 * (32 + 66 + 16);
 const MAX_PROFILE_LEN: usize = 64;
 /// Pays for the listing's storage, so anyone filling the contract pays to do it.
 const LISTING_DEPOSIT: NearToken = NearToken::from_millinear(10);
@@ -74,6 +78,8 @@ pub struct Room {
     pub mandate: String,
     /// Private deals: the bond has gone back to the buyer or over to the seller.
     pub bond_done: bool,
+    /// Private deals: the block a seller's claim on the bond takes effect. 0 if unclaimed.
+    pub forfeit_at: u64,
 }
 
 #[derive(Deserialize)]
@@ -201,12 +207,17 @@ impl Darkroom {
         self.pay(buyer, bond);
     }
 
-    /// A buyer who took a price and never paid loses the bond. Paying needs nothing from the
-    /// seller, and the room's receipt returns the bond, so an honest buyer never reaches this.
+    /// A buyer who took a price and never paid loses the bond, in two steps: the first call
+    /// opens a grace period in which a buyer who has paid can still show it.
     pub fn forfeit(&mut self, listing_id: u64, buyer: AccountId) {
-        let room = self.rooms.get(&(listing_id, buyer.clone())).expect("No room");
+        let room = self.rooms.get_mut(&(listing_id, buyer.clone())).expect("No room");
         require!(matches!(room.status, Status::Deal { .. }) && !room.bond_done, "No bond to take");
         require!(env::block_height() > room.opened_at + PAY_WINDOW_BLOCKS, "The buyer can still pay");
+        if room.forfeit_at == 0 {
+            room.forfeit_at = env::block_height() + FORFEIT_GRACE_BLOCKS;
+            return;
+        }
+        require!(env::block_height() > room.forfeit_at, "The buyer can still show payment");
         let bond = self.close_bond(listing_id, &buyer);
         let seller = self.listings.get(&listing_id).expect("No such listing").seller.clone();
         self.pay(seller, bond);
@@ -225,8 +236,6 @@ impl Darkroom {
     pub fn open_room(&mut self, listing_id: u64) -> Promise {
         require!(env::attached_deposit() >= MIN_RUN_DEPOSIT, "Attach at least 0.1 NEAR");
         let buyer = env::predecessor_account_id();
-        // The room's key for sealed limits is the relayer's, so private rooms keep to that door.
-        require!(!self.listings.get(&listing_id).expect("No such listing").private_settlement, "Private listings run through the relayer");
         let secrets = self.mark_running(listing_id, &buyer, "chain");
         let input = json!({ "op": "negotiate", "listing_id": listing_id, "buyer": buyer });
 
@@ -260,27 +269,70 @@ impl Darkroom {
         self.settle(listing_id, buyer, verdict);
     }
 
-    /// Frees a budget if a relayed run never reports back.
+    /// Frees a budget if a relayed run never reports back, and a slot if a room never starts.
     pub fn refund_stale(&mut self, listing_id: u64, buyer: AccountId) {
-        let room = self.rooms.get(&(listing_id, buyer.clone())).expect("No room");
-        require!(room.status == Status::Running, "Room is not running");
+        let room = self.rooms.get_mut(&(listing_id, buyer.clone())).expect("No room");
         require!(env::block_height() > room.opened_at + STALE_AFTER_BLOCKS, "Room is not stale yet");
+        if room.status == Status::Funded {
+            room.status = Status::Cancelled;
+            let cap = room.cap.0;
+            self.listings.get_mut(&listing_id).expect("No such listing").rooms_opened -= 1;
+            self.pay(buyer, cap);
+            return;
+        }
+        require!(room.status == Status::Running, "Room is not running");
         self.settle(listing_id, buyer, Value::Null);
     }
 
     /// Payment first, then reveal: the buyer's key gets the secret only after a recorded deal.
     /// Retryable, so a failed run costs a retry and not the secret. The buyer reads the result
     /// from OutLayer public storage under `reveal:<ct_ref>`.
+    /// `sealed_tx` is a private deal's Tempo payment, sealed to the room so NEAR shows no link.
+    /// A buyer needs no relayer for this, so a silent one cannot keep a paid buyer waiting.
     #[payable]
-    pub fn reveal(&mut self, listing_id: u64) -> Promise {
+    pub fn reveal(&mut self, listing_id: u64, sealed_tx: Option<String>) -> Promise {
         require!(env::attached_deposit() >= MIN_RUN_DEPOSIT, "Attach at least 0.1 NEAR");
         let buyer = env::predecessor_account_id();
         let room = self.rooms.get(&(listing_id, buyer.clone())).expect("No room");
         if !matches!(room.status, Status::Deal { .. }) {
             env::panic_str("No deal to reveal");
         }
-        let input = json!({ "op": "reveal", "listing_id": listing_id, "buyer": buyer });
+        if let Some(sealed) = &sealed_tx {
+            require!(is_hex(sealed, SEALED_TX_HEX_LEN), "Bad sealed payment");
+        }
+        let input = json!({ "op": "reveal", "listing_id": listing_id, "buyer": buyer, "sealed_tx": sealed_tx });
+        self.request_run(input, None, buyer.clone()).then(
+            Self::ext(env::current_account_id())
+                .with_static_gas(CALLBACK_GAS)
+                .on_reveal(listing_id, buyer),
+        )
+    }
+
+    /// Releases a private deal's price without a relayer.
+    #[payable]
+    pub fn request_terms(&mut self, listing_id: u64) -> Promise {
+        require!(env::attached_deposit() >= MIN_RUN_DEPOSIT, "Attach at least 0.1 NEAR");
+        let buyer = env::predecessor_account_id();
+        let room = self.rooms.get(&(listing_id, buyer.clone())).expect("No room");
+        require!(matches!(room.status, Status::Deal { .. }) && !room.bond_done, "No private deal");
+        let input = json!({ "op": "terms", "listing_id": listing_id, "buyer": buyer });
         self.request_run(input, None, buyer)
+    }
+
+    /// The room reveals a private deal only after it sees the payment, so this returns the bond.
+    #[private]
+    pub fn on_reveal(
+        &mut self,
+        listing_id: u64,
+        buyer: AccountId,
+        #[callback_result] result: Result<Value, PromiseError>,
+    ) {
+        let revealed = result.is_ok_and(|value| value["revealed"] == true);
+        let open = self.rooms.get(&(listing_id, buyer.clone())).is_some_and(|room| !room.bond_done);
+        if revealed && open {
+            let bond = self.close_bond(listing_id, &buyer);
+            self.pay(buyer, bond);
+        }
     }
 
     #[private]
@@ -380,10 +432,11 @@ impl Darkroom {
                 buyer_pubkey: open.buyer_pubkey,
                 protected_value: open.protected_value,
                 status: Status::Funded,
-                opened_at: 0,
+                opened_at: env::block_height(),
                 door: String::new(),
                 mandate,
                 bond_done: !private,
+                forfeit_at: 0,
             },
         );
     }
@@ -749,7 +802,7 @@ mod tests {
     fn no_reveal_before_a_deal() {
         let mut c = running();
         as_caller("buyer");
-        let _ = c.reveal(0);
+        let _ = c.reveal(0, None);
     }
 
     #[test]
@@ -758,7 +811,7 @@ mod tests {
         let mut c = running();
         c.on_room_result(0, acct("buyer"), Ok(Value::Null));
         as_caller("buyer");
-        let _ = c.reveal(0);
+        let _ = c.reveal(0, None);
     }
 
     #[test]
@@ -766,8 +819,8 @@ mod tests {
         let mut c = running();
         c.on_room_result(0, acct("buyer"), Ok(json!({"deal": true, "price": 5_000_000, "ct_ref": "r", "ct_hash": "h"})));
         as_caller("buyer");
-        let _ = c.reveal(0);
-        let _ = c.reveal(0);
+        let _ = c.reveal(0, None);
+        let _ = c.reveal(0, None);
     }
 
     #[test]
@@ -776,7 +829,7 @@ mod tests {
         let mut c = running();
         c.on_room_result(0, acct("buyer"), Ok(json!({"deal": true, "price": 5_000_000, "ct_ref": "r", "ct_hash": "h"})));
         as_caller("stranger");
-        let _ = c.reveal(0);
+        let _ = c.reveal(0, None);
     }
 
     #[test]
@@ -865,18 +918,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Private listings run through the relayer")]
-    fn a_private_room_has_one_door() {
-        as_caller("seller");
-        let mut c = Darkroom::new(acct("outlayer"), "o/room".to_string(), acct("usdc"), hex::encode(signing_key().verifying_key().to_bytes()));
-        c.list("p".to_string(), "t".to_string(), 3, COMMITMENT.to_string(), None, true, U128(BOND));
-        as_caller("usdc");
-        c.ft_on_transfer(acct("buyer"), U128(BOND), sealed_msg(0));
-        as_caller("buyer");
-        c.open_room(0);
-    }
-
-    #[test]
     #[should_panic(expected = "Budget below the lowest price")]
     fn a_dust_room_is_refused() {
         let mut c = funded();
@@ -942,11 +983,41 @@ mod tests {
     }
 
     #[test]
-    fn a_buyer_who_never_pays_loses_the_bond() {
+    fn a_buyer_who_never_pays_loses_the_bond_after_the_grace() {
         let mut c = private_deal();
         at_block(PAY_WINDOW_BLOCKS + 1);
         c.forfeit(0, acct("buyer"));
+        assert!(!c.get_room(0, acct("buyer")).unwrap().bond_done);
+        at_block(PAY_WINDOW_BLOCKS + FORFEIT_GRACE_BLOCKS + 2);
+        c.forfeit(0, acct("buyer"));
         assert!(c.get_room(0, acct("buyer")).unwrap().bond_done);
+    }
+
+    #[test]
+    #[should_panic(expected = "The buyer can still show payment")]
+    fn a_seller_cannot_rush_the_grace() {
+        let mut c = private_deal();
+        at_block(PAY_WINDOW_BLOCKS + 1);
+        c.forfeit(0, acct("buyer"));
+        c.forfeit(0, acct("buyer"));
+    }
+
+    #[test]
+    fn a_paid_buyer_beats_a_claimed_forfeit() {
+        let mut c = private_deal();
+        at_block(PAY_WINDOW_BLOCKS + 1);
+        c.forfeit(0, acct("buyer"));
+        c.confirm_paid(0, acct("buyer"), sign_text("darkroom-paid-v1|darkroom|0|buyer".to_string()));
+        assert!(c.get_room(0, acct("buyer")).unwrap().bond_done);
+    }
+
+    #[test]
+    fn a_room_that_never_starts_can_be_cleared_by_anyone() {
+        let mut c = funded();
+        at_block(STALE_AFTER_BLOCKS + 1);
+        c.refund_stale(0, acct("buyer"));
+        assert_eq!(status(&c), Status::Cancelled);
+        assert_eq!(c.get_listing(0).unwrap().rooms_opened, 0);
     }
 
     #[test]

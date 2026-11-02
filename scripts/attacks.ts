@@ -101,7 +101,7 @@ await refused("a huge profile to fill the contract", "Profile too long", () => c
 await refused("a listing with no storage deposit", "Attach 0.01 NEAR", () => call(attacker, contract, "list", {
   profile: "p", title: "t", max_rooms: 1, commitment, target: null, private_settlement: false, bond: "0",
 }, "0 NEAR"));
-await refused("the chain door into a private room", "Private listings run through the relayer", () => call(attacker, contract, "open_room", { listing_id: hidden }, "0.1 NEAR"));
+await refused("terms for a room with no deal, through the contract", "No private deal", () => call(buyer, contract, "request_terms", { listing_id: hidden }, "0.1 NEAR"));
 await refused("paid signature with no deal", "No bond to return", () => call(attacker, contract, "confirm_paid", { listing_id: hidden, buyer, sig: "cd".repeat(64) }, "0 NEAR"));
 await refused("taking a bond with no deal", "No bond to take", () => call(attacker, contract, "forfeit", { listing_id: hidden, buyer }, "0 NEAR"));
 

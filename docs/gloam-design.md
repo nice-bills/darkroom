@@ -23,7 +23,7 @@ Keeping a private note safe needs the room to make the sweep proof itself, which
 2. On a deal the room signs a verdict with price 0. The chain records a deal and learns no price.
 3. After the chain records the deal, the `terms` run seals the price and the room's address to the buyer at a fixed size. A verdict seen early by a relayer shows no price.
 4. The buyer shields a fixed 200 USDC, splits off the exact price as a private note, and cashes it out to the address through Gloam's relay. The cash out is final on arrival.
-5. Anyone runs the reveal with the transaction hash, which stays off NEAR. The room reads the receipt from two RPCs, confirms the address received the price in the right token, and seals the secret to the buyer. It also signs a receipt that returns the buyer's bond.
+5. The buyer runs the reveal through a relayer or the contract, with the transaction hash sealed to the room, so NEAR shows no link. The room reads the receipt from two RPCs, confirms the address received the price in the right token, and seals the secret to the buyer. The bond returns through a signed receipt or the contract callback.
 
 ## Failure cases
 
@@ -34,6 +34,8 @@ Keeping a private note safe needs the room to make the sweep proof itself, which
 | Buyer takes the money back | A cash out cannot be undone |
 | Buyer learns the price and walks | Nothing is released. The buyer learned the deal bit and bucket, and loses the bond after the window |
 | Seller goes quiet | Nothing needed: the money is theirs on arrival |
+| Relayer goes quiet, or is the seller | The buyer runs terms and reveal from the contract |
+| Seller claims the bond while a buyer is paying | The claim opens a grace period, and showing payment wins |
 | Seller deletes their row | The seed and secret are sealed with the deal |
 | One RPC lies | The two sources disagree. No reveal |
 

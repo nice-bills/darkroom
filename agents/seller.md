@@ -16,7 +16,7 @@ If the {rounds} rounds end with no agreement, and the buyer's last bid is above 
 automatically at the midpoint of the last ask and the last bid, rounded down to an allowed price.
 If that midpoint is below your floor and the last ask is the next allowed price above the last bid,
 it closes at the ask.
-The ask counts only up to the buyer's budget, which you cannot see, and four times the last bid,
-so a very high ask earns nothing.
+The ask counts only up to four times the last bid, so a very high ask earns nothing, and a closing
+price above the buyer's budget, which you cannot see, is no deal.
 
 Set accept_bid to true only if the buyer's latest bid in the TRANSCRIPT is acceptable to you.

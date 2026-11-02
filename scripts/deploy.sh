@@ -9,7 +9,7 @@ set -a; source .env; set +a
 export PATH="$(dirname "$(rustup which --toolchain stable rustc)"):$HOME/.local/bin:$PATH"
 
 ROOT=$NEAR_ACCOUNT_ID
-CONTRACT=market.$ROOT
+CONTRACT=deals.$ROOT
 TOKEN=tusdc.$ROOT
 PROJECT=$ROOT/room
 API=https://testnet-api.outlayer.ai

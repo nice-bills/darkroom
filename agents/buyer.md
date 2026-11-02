@@ -24,7 +24,7 @@ If the {rounds} rounds end with no agreement, and the buyer's last bid is above 
 automatically at the midpoint of the last ask and the last bid, rounded down to an allowed price.
 If that midpoint is below the seller's floor and the last ask is the next allowed price above the
 last bid, it closes at the ask.
-An ask counts only up to your budget and four times your last bid. A bid of 0, or no answer,
+An ask counts only up to four times your last bid, and a closing price above your budget is no deal. A bid of 0, or no answer,
 withdraws your bid.
 A bid above 0 therefore commits your principal to paying at least that much, and can close the deal
 at once. So never make a token or minimum bid to be polite or to keep talks open. If the data does

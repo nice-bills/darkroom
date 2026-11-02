@@ -1,6 +1,7 @@
 // Private settlement through Gloam on Tempo testnet. Run with Node: snarkjs crashes under Bun.
 //   pay <address> <price> <ct_ref> <account>  shields, cashes out, prints the payment's hash
 //   balance <seed> <ct_ref>                   what a room's one-time address holds
+//   reclaim <ct_ref> <account> <address>      cashes out the rest of the shielded amount
 import * as G from "@gloamtrade/sdk";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -20,6 +21,7 @@ const SHIELD_WEI = 200_000_000n;
 const CACHE = join(DIR, "circuits");
 const client = createPublicClient({ chain: net.chain, transport: http(net.rpcUrl) });
 const erc20 = parseAbi(["function approve(address,uint256) returns (bool)", "function balanceOf(address) view returns (uint256)"]);
+const UNSHIELD_ABI = parseAbi(["function unshield(bytes,bytes32,bytes32,address,address,uint256)"]);
 const wait = (hash) => client.waitForTransactionReceipt({ hash });
 const log = (text) => process.stderr.write(`${text}\n`);
 
@@ -58,20 +60,24 @@ async function pathFor(commitment) {
 /// Through Gloam's relay when it is up, so our address is not beside the payment. The proof binds
 /// the transfer, so the relay can only send or refuse. If it refuses, we send it ourselves.
 async function submit(sender, intent, abi) {
-  const up = (await G.relayStatus().catch(() => [])).some((n) => n.chainId === net.chainId && n.enabled && !n.lowBalance);
-  if (up) {
-    try {
-      const hash = await G.relayIntent(intent);
-      await wait(hash);
-      log("sent through the Gloam relay");
-      return hash;
-    } catch (error) {
-      log(`relay refused: ${error.message}`);
+  const send = async () => {
+    const up = (await G.relayStatus().catch(() => [])).some((n) => n.chainId === net.chainId && n.enabled && !n.lowBalance);
+    if (up) {
+      try {
+        const hash = await G.relayIntent(intent);
+        log("sent through the Gloam relay");
+        return hash;
+      } catch (error) {
+        log(`relay refused: ${error.message}`);
+      }
     }
-  }
-  const { exec } = intent;
-  const receipt = await wait(await sender.writeContract({ address: net.pool, abi, functionName: exec.fn, args: exec.args }));
-  return receipt.transactionHash;
+    const { exec } = intent;
+    return sender.writeContract({ address: net.pool, abi, functionName: exec.fn, args: exec.args });
+  };
+  const hash = await send();
+  const receipt = await wait(hash);
+  if (receipt.status !== "success") throw new Error(`transaction reverted: ${hash}`);
+  return hash;
 }
 
 /// Mirrors `payee_key` in enclave/core/src/gloam.rs.
@@ -81,45 +87,76 @@ const payeeKey = (seedHex, ctRef) => `0x${createHash("sha256")
   .update(ctRef)
   .digest("hex")}`;
 
+const seen = (commitment) => client.readContract({ address: net.pool, abi: G.POOL_STATE_ABI, functionName: "commitmentSeen", args: [commitment] });
+const spent = (nullifier) => client.readContract({ address: net.pool, abi: G.POOL_STATE_ABI, functionName: "isSpent", args: [nullifier] });
+const bigints = (_key, value) => (typeof value === "bigint" ? { $big: value.toString() } : value);
+const revive = (_key, value) => (value?.$big ? BigInt(value.$big) : value);
+
+/// Every step is written down before its money moves, and each is checked against the chain on
+/// a rerun, so a failure at any point resumes and never makes a second note over the first.
 async function pay(payee, priceText, ctRef, account) {
   const price = BigInt(priceText);
-  const notes = join(DIR, `notes-${ctRef}.json`);
-  const saved = (name, note) => writeFileSync(join(DIR, `${name}-${ctRef}.json`), JSON.stringify(note), { mode: 0o600 });
+  const file = join(DIR, `pay-${ctRef}.json`);
+  const state = existsSync(file) ? JSON.parse(readFileSync(file, "utf8"), revive) : {};
+  const save = () => writeFileSync(file, JSON.stringify(state, bigints), { mode: 0o600 });
+  if (state.tx) return console.log(state.tx);
   const payer = await funded(`${account}-${ctRef}`);
-  // Resumable: a note that is only in memory is money lost if the next step fails.
-  let note = existsSync(notes) ? JSON.parse(readFileSync(notes, "utf8")) : null;
-  if (!note) {
+
+  if (!state.shield) {
     const shield = await G.buildShieldBoundIntent({
       chainId: net.chainId, poolAddress: net.pool, asset, amountWei: SHIELD_WEI, prover: await prover("shield"),
     });
-    saved("shielded", { secret: shield.note.secret, commitment: shield.note.commitment });
+    state.shield = { note: shield.note, exec: shield.exec };
+    save();
+  }
+  if (!(await seen(state.shield.note.commitment))) {
     await wait(await payer.writeContract({ address: asset, abi: erc20, functionName: "approve", args: [net.pool, SHIELD_WEI] }));
     const shielded = await wait(await payer.writeContract({
-      address: shield.exec.poolAddress,
+      address: state.shield.exec.poolAddress,
       abi: parseAbi(["function shieldBound(address,uint256,bytes32,bytes)"]),
-      functionName: shield.exec.fn,
-      args: shield.exec.args,
+      functionName: state.shield.exec.fn,
+      args: state.shield.exec.args,
     }));
+    if (shielded.status !== "success") throw new Error("shield reverted");
     log(`shield tx ${shielded.transactionHash}`);
-    // A cash out spends a whole note, so first split off exactly the price.
+  }
+
+  // A cash out spends a whole note, so first split off exactly the price.
+  if (!state.split) {
     const split = await G.buildPrivateSendIntent({
-      secretHex: shield.note.secret, amountInWei: SHIELD_WEI, amountPayWei: price, asset,
-      path: await pathFor(shield.note.commitment), prove: await prover("transfer"),
+      secretHex: state.shield.note.secret, amountInWei: SHIELD_WEI, amountPayWei: price, asset,
+      path: await pathFor(state.shield.note.commitment), prove: await prover("transfer"),
       poolAddress: net.pool, chainId: net.chainId,
     });
-    note = { secret: split.paymentNote.secret, commitment: split.paymentNote.commitment };
-    saved("notes", note);
-    saved("change", split.changeNote);
-    const hash = await submit(payer, { chainId: net.chainId, exec: { fn: "transfer", args: G.transferCallArgs(split) } }, G.POOL_TRANSFER_ABI);
-    log(`split tx ${hash}`);
+    state.split = { note: split.paymentNote, change: split.changeNote, args: G.transferCallArgs(split) };
+    save();
   }
+  if (!(await seen(state.split.note.commitment))) {
+    log(`split tx ${await submit(payer, { chainId: net.chainId, exec: { fn: "transfer", args: state.split.args } }, G.POOL_TRANSFER_ABI)}`);
+  }
+
+  const nullifier = G.fieldToBytes32(await G.noteNullifierPoseidon(G.hexToField(state.split.note.secret), G.hexToField(state.split.note.commitment)));
+  if (await spent(nullifier)) throw new Error(`The payment landed but its hash was lost. Find it on Tempo for ${payee}, then pass buyer fetch --tx`);
   const cashOut = await G.buildUnshieldIntent({
-    secretHex: note.secret, amountWei: price, asset, to: payee,
-    path: await pathFor(note.commitment), prove: await prover("unshield"),
+    secretHex: state.split.note.secret, amountWei: price, asset, to: payee,
+    path: await pathFor(state.split.note.commitment), prove: await prover("unshield"),
     poolAddress: net.pool, chainId: net.chainId,
   });
-  const abi = parseAbi(["function unshield(bytes,bytes32,bytes32,address,address,uint256)"]);
-  console.log(await submit(payer, cashOut, abi));
+  state.tx = await submit(payer, cashOut, UNSHIELD_ABI);
+  save();
+  console.log(state.tx);
+}
+
+/// Takes what is left of the shielded amount back out, to any address.
+async function reclaim(ctRef, account, to) {
+  const { split } = JSON.parse(readFileSync(join(DIR, `pay-${ctRef}.json`), "utf8"), revive);
+  const amountWei = BigInt(split.change.amountWei);
+  const intent = await G.buildUnshieldIntent({
+    secretHex: split.change.secret, amountWei, asset, to,
+    path: await pathFor(split.change.commitment), prove: await prover("unshield"),
+    poolAddress: net.pool, chainId: net.chainId,
+  });
+  console.log(await submit(wallet(`${account}-${ctRef}`), intent, UNSHIELD_ABI));
 }
 
 /// What a room's one-time address holds. Only the holder of the seed can spend it.
@@ -131,5 +168,5 @@ async function balance(seedHex, ctRef) {
 
 mkdirSync(DIR, { recursive: true, mode: 0o700 });
 const [command, ...args] = process.argv.slice(2);
-await ({ pay, balance })[command](...args);
+await ({ pay, balance, reclaim })[command](...args);
 process.exit(0);

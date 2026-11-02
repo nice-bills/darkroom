@@ -73,8 +73,8 @@ Bun.serve({
       return json({ busy: state.busy, runs_today: state.runs, daily_limit: DAILY_LIMIT });
     }
     if (request.method === "POST" && pathname === "/run") {
-      const body = await request.json().catch(() => ({}));
-      if (!Object.hasOwn(FLOWS, body.flow)) return json({ error: "flow must be private, escrow or chain" }, 400);
+      const body = await request.json().catch(() => null);
+      if (!Object.hasOwn(FLOWS, body?.flow)) return json({ error: "flow must be private, escrow or chain" }, 400);
       // Render puts the real client first.
       const client = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? "local";
       const refused = admit(state, Date.now(), DAILY_LIMIT, client);

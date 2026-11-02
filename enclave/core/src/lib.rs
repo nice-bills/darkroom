@@ -67,12 +67,12 @@ pub trait Host {
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Input {
     Negotiate { listing_id: u64, buyer: String },
-    /// `tx` is the Tempo payment of a private deal. It stays off NEAR, so nothing links the two.
+    /// `sealed_tx` is a private deal's Tempo payment, sealed to the room, so NEAR shows no link.
     Reveal {
         listing_id: u64,
         buyer: String,
         #[serde(default)]
-        tx: Option<String>,
+        sealed_tx: Option<String>,
     },
     /// Releases a private deal's price, once the chain has recorded the deal.
     Terms { listing_id: u64, buyer: String },
@@ -251,12 +251,14 @@ pub fn negotiate(host: &mut dyn Host, deal: &Deal) -> Result<Verdict, Error> {
 
     // Without this, agents hold firm until the rounds run out and good data never sells. A zero
     // bid is not a bid, so data the buyer's agent rejects still ends in no deal. The ask counts
-    // only up to the cap and a few times the bid: opening high must not kill a fair deal, and
-    // the price must not trace the sealed cap.
+    // only up to a few times the bid: opening high must not kill a fair deal. The cap stays out
+    // of this sum and only filters, so the price does not trace the sealed cap.
     if let (None, Some(ask), Some(bid)) = (agreed, last_ask, last_bid) {
         // One bucket apart at the reserve has no price between them, so the ask closes it.
         let adjacent = PRICE_BUCKETS.windows(2).any(|pair| pair == [bid, ask]);
-        let midpoint = bucket_floor((ask.min(cap_usdc).min(bid.saturating_mul(MAX_ASK_OVER_BID)) + bid) / 2).filter(|mid| acceptable(*mid));
+        // A bid above the ask must not lift the price past what the seller asked.
+        let bid = bid.min(ask);
+        let midpoint = bucket_floor((ask.min(bid.saturating_mul(MAX_ASK_OVER_BID)) + bid) / 2).filter(|mid| acceptable(*mid));
         agreed = midpoint.or(Some(ask).filter(|ask| adjacent && acceptable(*ask)));
     }
 
@@ -469,11 +471,14 @@ fn mandate_secret(host: &mut dyn Host) -> Result<[u8; 32], Error> {
 fn public_keys(host: &mut dyn Host, contract: &str) -> Result<Value, Error> {
     let mandate_key = to_hex(PublicKey::from(&StaticSecret::from(mandate_secret(host)?)).as_bytes());
     let signed = format!("darkroom-mandate-v1|{contract}|{mandate_key}");
-    Ok(json!({
+    let keys = json!({
         "public_key": to_hex(&host.public_key()?),
         "mandate_key": mandate_key,
         "mandate_sig": to_hex(&host.sign(signed.as_bytes())?),
-    }))
+    });
+    // Published, so a buyer who has no relayer can still read it.
+    host.publish("room-keys", keys.to_string().as_bytes())?;
+    Ok(keys)
 }
 
 fn reveal_room(
@@ -482,7 +487,7 @@ fn reveal_room(
     vault: &gloam::Vault,
     listing_id: u64,
     buyer: &str,
-    tx: Option<&str>,
+    sealed_tx: Option<&str>,
 ) -> Result<Value, Error> {
     let room = host.view("get_room", json!({ "listing_id": listing_id, "buyer": buyer }))?;
     let deal = &room["status"]["Deal"];
@@ -496,7 +501,9 @@ fn reveal_room(
     if listing["private_settlement"] != true {
         return reveal(host, ct_ref, ct_hash, buyer_key, None);
     }
-    let tx = tx.ok_or("private deal needs its Tempo payment")?;
+    let sealed_tx = sealed_tx.ok_or("private deal needs its Tempo payment")?;
+    let tx = open_delivery(mandate_secret(host)?, &from_hex(sealed_tx)?).ok_or("payment was not sealed to this room")?;
+    let tx = std::str::from_utf8(&tx)?;
     let check = |host: &mut dyn Host, price: u64, seed: &[u8]| {
         gloam::check_payment(host, vault, seed, tx, ct_ref, price)
     };
@@ -552,7 +559,7 @@ pub fn run(
         Input::Negotiate { listing_id, buyer } => {
             serde_json::to_string(&negotiate_room(host, contract, listing_id, &buyer, &env)?)?
         }
-        Input::Reveal { listing_id, buyer, tx } => reveal_room(host, contract, vault, listing_id, &buyer, tx.as_deref())?.to_string(),
+        Input::Reveal { listing_id, buyer, sealed_tx } => reveal_room(host, contract, vault, listing_id, &buyer, sealed_tx.as_deref())?.to_string(),
         Input::Terms { listing_id, buyer } => release_terms(host, listing_id, &buyer)?.to_string(),
         Input::PublicKey {} => public_keys(host, contract)?.to_string(),
     };
@@ -800,7 +807,7 @@ mod tests {
         private_deal(&mut host);
         let error = run(&mut host, CONTRACT, &VAULT, REVEAL, env).unwrap_err().to_string();
         assert_eq!(error, "private deal needs its Tempo payment");
-        assert!(host.public.is_empty());
+        assert!(!host.public.keys().any(|key| key.starts_with("reveal:")));
     }
 
     #[test]
@@ -827,10 +834,16 @@ mod tests {
     #[test]
     fn the_price_does_not_trace_a_sealed_cap() {
         let price = |cap| {
-            let replies = [seller(200, false), buyer(false, 5), seller(200, false), buyer(false, 5), seller(200, false), buyer(false, 5)];
+            let replies = [seller(200, false), buyer(false, 20), seller(200, false), buyer(false, 20), seller(200, false), buyer(false, 20)];
             talk(&replies, &deal(cap, 2)).1.price / USDC
         };
         assert_eq!(price(50), price(200));
+    }
+
+    #[test]
+    fn a_deal_never_closes_above_the_ask() {
+        let (_, v) = talk(&[seller(5, false), buyer(false, 20), seller(5, false), buyer(false, 20), seller(5, false), buyer(false, 20)], &deal(50, 2));
+        assert_eq!(v.price, 5 * USDC);
     }
 
     #[test]
@@ -875,7 +888,7 @@ mod tests {
     #[test]
     fn midpoint_still_respects_cap_and_reserve() {
         let over: Vec<String> = (0..6).map(|i| if i % 2 == 0 { seller(200, false) } else { buyer(false, 100) }).collect();
-        assert_eq!(talk(&over, &deal(50, 5)).1.price, 50 * USDC);
+        assert!(!talk(&over, &deal(50, 5)).1.deal);
         let under: Vec<String> = (0..6).map(|i| if i % 2 == 0 { seller(2, false) } else { buyer(false, 1) }).collect();
         assert!(!talk(&under, &deal(50, 5)).1.deal);
     }

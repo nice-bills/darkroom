@@ -333,7 +333,7 @@ async fn flow(wasm: &str) -> Result<()> {
 
     let fake = json!({ "op": "reveal", "listing_id": 0, "buyer": "buyer.testnet" });
     check("reveal before any deal is refused", room.run(&fake, key).await.is_err())?;
-    check("nothing public yet", chain.lock().unwrap().public.is_empty())?;
+    check("no secret public yet", !chain.lock().unwrap().public.keys().any(|key| key.starts_with("reveal:")))?;
 
     replies.lock().unwrap().extend([
         r#"{"ask":10,"accept_bid":false,"note":"n"}"#.to_string(),
@@ -418,7 +418,8 @@ async fn private_flow(room: &Room, chain: &Arc<Mutex<Chain>>, replies: &Arc<Mute
 
     let leaked = |chain: &Arc<Mutex<Chain>>| chain.lock().unwrap().public.contains_key("reveal:7-buyer.testnet");
     let tx = format!("0x{}", "11".repeat(32));
-    let reveal = json!({ "op": "reveal", "listing_id": 7, "buyer": "buyer.testnet", "tx": tx });
+    let sealed_tx = seal_to_buyer([5; 32], &room_key, tx.as_bytes()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let reveal = json!({ "op": "reveal", "listing_id": 7, "buyer": "buyer.testnet", "sealed_tx": hex::encode(sealed_tx) });
     check("no payment, no reveal", room.run(&reveal_input(7), key).await.is_err() && !leaked(chain))?;
 
     let receipt = |to: &str, amount: u64| json!({ "status": "0x1", "logs": [{

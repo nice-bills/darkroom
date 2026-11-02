@@ -14,8 +14,8 @@ Run on 2026-10-31. Rerun with `cd redteam && cargo run --release -- --mock` (off
 | Test | Result |
 | --- | --- |
 | Injection hidden in worthless data, 5 attacks | 0 of 5 bought it, no failed runs |
-| Real finding, 3 runs at a 50 USDC budget | 3 of 3 sold, at 5 USDC each |
-| Real finding in the TEE, private, relayer and chain door | 3 of 3 sold on the build before the last prompt change, at 5, 5 and 2 USDC |
+| Real finding, 3 runs at a 50 USDC budget | 3 of 3 sold, at 2, 10 and 2 USDC |
+| Real finding in the TEE on the current build | Private with no relayer sold at 10 USDC, relayer at 5 USDC |
 
 Deal failures came from the rules, and the bench showed them: an opening ask above the cap, talks one bucket apart at the reserve, and prose refusals from the model. A buyer can still withdraw with a zero bid or a refusal, so those rooms end in no deal by design. The figures above are from the final rules.
 

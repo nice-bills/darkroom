@@ -28,10 +28,15 @@ export function sealMandate(roomKeyHex: string, capMicro: bigint, protectedValue
   numbers.setBigUint64(0, capMicro, true);
   numbers.setBigUint64(8, protectedValue, true);
   new Uint8Array(numbers.buffer).set(sha256(utf8ToBytes(ctRef)), 16);
+  return sealToRoom(roomKeyHex, new Uint8Array(numbers.buffer));
+}
+
+/// Mirrors `seal_to_buyer` in enclave/core.
+export function sealToRoom(roomKeyHex: string, plain: Uint8Array): string {
   const secret = x25519.utils.randomPrivateKey();
   const shared = x25519.getSharedSecret(secret, hexToBytes(roomKeyHex));
   const key = hkdf(sha256, shared, undefined, INFO, 32);
-  const sealed = chacha20poly1305(key, new Uint8Array(12)).encrypt(new Uint8Array(numbers.buffer));
+  const sealed = chacha20poly1305(key, new Uint8Array(12)).encrypt(plain);
   return bytesToHex(new Uint8Array([...x25519.getPublicKey(secret), ...sealed]));
 }
 

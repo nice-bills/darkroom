@@ -7,7 +7,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 set -a; source .env; set +a
 export PATH="$HOME/.local/bin:$PATH"
-export DARKROOM_CONTRACT=market.$NEAR_ACCOUNT_ID
+export DARKROOM_CONTRACT=deals.$NEAR_ACCOUNT_ID
 PROJECT=$NEAR_ACCOUNT_ID/room
 retry() { for attempt in 1 2 3 4; do "$@" && return 0; sleep $((attempt * 5)); done; return 1; }
 
